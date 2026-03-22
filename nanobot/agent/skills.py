@@ -5,6 +5,7 @@ import os
 import re
 import shutil
 from pathlib import Path
+from typing import Any, Dict, List, Optional
 
 # Default builtin skills directory (relative to this file)
 BUILTIN_SKILLS_DIR = Path(__file__).parent.parent / "skills"
@@ -18,12 +19,12 @@ class SkillsLoader:
     specific tools or perform certain tasks.
     """
 
-    def __init__(self, workspace: Path, builtin_skills_dir: Path | None = None):
-        self.workspace = workspace
-        self.workspace_skills = workspace / "skills"
-        self.builtin_skills = builtin_skills_dir or BUILTIN_SKILLS_DIR
+    def __init__(self, workspace: Path, builtin_skills_dir: Optional[Path] = None):
+        self.workspace: Path = workspace
+        self.workspace_skills: Path = workspace / "skills"
+        self.builtin_skills: Path = builtin_skills_dir or BUILTIN_SKILLS_DIR
 
-    def list_skills(self, filter_unavailable: bool = True) -> list[dict[str, str]]:
+    def list_skills(self, filter_unavailable: bool = True) -> List[Dict[str, str]]:
         """
         List all available skills.
 
@@ -33,7 +34,7 @@ class SkillsLoader:
         Returns:
             List of skill info dicts with 'name', 'path', 'source'.
         """
-        skills = []
+        skills: List[Dict[str, str]] = []
 
         # Workspace skills (highest priority)
         if self.workspace_skills.exists():
@@ -41,22 +42,40 @@ class SkillsLoader:
                 if skill_dir.is_dir():
                     skill_file = skill_dir / "SKILL.md"
                     if skill_file.exists():
-                        skills.append({"name": skill_dir.name, "path": str(skill_file), "source": "workspace"})
+                        skills.append(
+                            {
+                                "name": skill_dir.name,
+                                "path": str(skill_file),
+                                "source": "workspace",
+                            }
+                        )
 
         # Built-in skills
         if self.builtin_skills and self.builtin_skills.exists():
             for skill_dir in self.builtin_skills.iterdir():
                 if skill_dir.is_dir():
                     skill_file = skill_dir / "SKILL.md"
-                    if skill_file.exists() and not any(s["name"] == skill_dir.name for s in skills):
-                        skills.append({"name": skill_dir.name, "path": str(skill_file), "source": "builtin"})
+                    if skill_file.exists() and not any(
+                        s["name"] == skill_dir.name for s in skills
+                    ):
+                        skills.append(
+                            {
+                                "name": skill_dir.name,
+                                "path": str(skill_file),
+                                "source": "builtin",
+                            }
+                        )
 
         # Filter by requirements
         if filter_unavailable:
-            return [s for s in skills if self._check_requirements(self._get_skill_meta(s["name"]))]
+            return [
+                s
+                for s in skills
+                if self._check_requirements(self._get_skill_meta(s["name"]))
+            ]
         return skills
 
-    def load_skill(self, name: str) -> str | None:
+    def load_skill(self, name: str) -> Optional[str]:
         """
         Load a skill by name.
 
@@ -79,7 +98,7 @@ class SkillsLoader:
 
         return None
 
-    def load_skills_for_context(self, skill_names: list[str]) -> str:
+    def load_skills_for_context(self, skill_names: List[str]) -> str:
         """
         Load specific skills for inclusion in agent context.
 
@@ -89,7 +108,7 @@ class SkillsLoader:
         Returns:
             Formatted skills content.
         """
-        parts = []
+        parts: List[str] = []
         for name in skill_names:
             content = self.load_skill(name)
             if content:
@@ -115,7 +134,7 @@ class SkillsLoader:
         def escape_xml(s: str) -> str:
             return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
-        lines = ["<skills>"]
+        lines: List[str] = ["<skills>"]
         for s in all_skills:
             name = escape_xml(s["name"])
             path = s["path"]
@@ -123,7 +142,7 @@ class SkillsLoader:
             skill_meta = self._get_skill_meta(s["name"])
             available = self._check_requirements(skill_meta)
 
-            lines.append(f"  <skill available=\"{str(available).lower()}\">")
+            lines.append(f'  <skill available="{str(available).lower()}">')
             lines.append(f"    <name>{name}</name>")
             lines.append(f"    <description>{desc}</description>")
             lines.append(f"    <location>{path}</location>")
@@ -139,9 +158,9 @@ class SkillsLoader:
 
         return "\n".join(lines)
 
-    def _get_missing_requirements(self, skill_meta: dict) -> str:
+    def _get_missing_requirements(self, skill_meta: Dict[str, Any]) -> str:
         """Get a description of missing requirements."""
-        missing = []
+        missing: List[str] = []
         requires = skill_meta.get("requires", {})
         for b in requires.get("bins", []):
             if not shutil.which(b):
@@ -163,18 +182,22 @@ class SkillsLoader:
         if content.startswith("---"):
             match = re.match(r"^---\n.*?\n---\n", content, re.DOTALL)
             if match:
-                return content[match.end():].strip()
+                return content[match.end() :].strip()
         return content
 
-    def _parse_nanobot_metadata(self, raw: str) -> dict:
+    def _parse_nanobot_metadata(self, raw: str) -> Dict[str, Any]:
         """Parse skill metadata JSON from frontmatter (supports nanobot and openclaw keys)."""
         try:
             data = json.loads(raw)
-            return data.get("nanobot", data.get("openclaw", {})) if isinstance(data, dict) else {}
+            return (
+                data.get("nanobot", data.get("openclaw", {}))
+                if isinstance(data, dict)
+                else {}
+            )
         except (json.JSONDecodeError, TypeError):
             return {}
 
-    def _check_requirements(self, skill_meta: dict) -> bool:
+    def _check_requirements(self, skill_meta: Dict[str, Any]) -> bool:
         """Check if skill requirements are met (bins, env vars)."""
         requires = skill_meta.get("requires", {})
         for b in requires.get("bins", []):
@@ -185,14 +208,14 @@ class SkillsLoader:
                 return False
         return True
 
-    def _get_skill_meta(self, name: str) -> dict:
+    def _get_skill_meta(self, name: str) -> Dict[str, Any]:
         """Get nanobot metadata for a skill (cached in frontmatter)."""
         meta = self.get_skill_metadata(name) or {}
         return self._parse_nanobot_metadata(meta.get("metadata", ""))
 
-    def get_always_skills(self) -> list[str]:
+    def get_always_skills(self) -> List[str]:
         """Get skills marked as always=true that meet requirements."""
-        result = []
+        result: List[str] = []
         for s in self.list_skills(filter_unavailable=True):
             meta = self.get_skill_metadata(s["name"]) or {}
             skill_meta = self._parse_nanobot_metadata(meta.get("metadata", ""))
@@ -200,7 +223,7 @@ class SkillsLoader:
                 result.append(s["name"])
         return result
 
-    def get_skill_metadata(self, name: str) -> dict | None:
+    def get_skill_metadata(self, name: str) -> Optional[Dict[str, str]]:
         """
         Get metadata from a skill's frontmatter.
 
@@ -210,7 +233,7 @@ class SkillsLoader:
         Returns:
             Metadata dict or None.
         """
-        content = self.load_skill(name)
+        content = self.load_skill(.name)
         if not content:
             return None
 
@@ -218,11 +241,11 @@ class SkillsLoader:
             match = re.match(r"^---\n(.*?)\n---", content, re.DOTALL)
             if match:
                 # Simple YAML parsing
-                metadata = {}
+                metadata: Dict[str, str] = {}
                 for line in match.group(1).split("\n"):
                     if ":" in line:
                         key, value = line.split(":", 1)
-                        metadata[key.strip()] = value.strip().strip('"\'')
+                        metadata[key.strip()] = value.strip().strip('\"\'')
                 return metadata
 
         return None

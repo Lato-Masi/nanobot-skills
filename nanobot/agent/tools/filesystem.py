@@ -98,9 +98,6 @@ class ReadFileTool(_FsTool):
         offset = kwargs.get("offset", 1)
         limit = kwargs.get("limit")
 
-        if not path:
-            return "Error: path is a required parameter."
-
         try:
             fp = self._resolve(path)
             if not fp.exists():
@@ -124,8 +121,6 @@ class ReadFileTool(_FsTool):
             all_lines = text_content.splitlines()
             total = len(all_lines)
 
-            if offset < 1:
-                offset = 1
             if offset > total:
                 return f"Error: offset {offset} is beyond end of file ({total} lines)"
 
@@ -184,9 +179,6 @@ class WriteFileTool(_FsTool):
     async def execute(self, **kwargs: Any) -> str:
         path = kwargs.get("path")
         content = kwargs.get("content")
-
-        if not path or content is None:
-            return "Error: path and content are required parameters."
 
         try:
             fp = self._resolve(path)
@@ -266,8 +258,8 @@ class EditFileTool(_FsTool):
         new_text = kwargs.get("new_text")
         replace_all = kwargs.get("replace_all", False)
 
-        if not path or old_text is None or new_text is None:
-            return "Error: path, old_text, and new_text are required parameters."
+        if old_text is None or new_text is None:
+            return "Error: old_text and new_text are required parameters."
 
         try:
             fp = self._resolve(path)
@@ -371,9 +363,6 @@ class ListDirTool(_FsTool):
         path = kwargs.get("path")
         recursive = kwargs.get("recursive", False)
         max_entries = kwargs.get("max_entries")
-
-        if not path:
-            return "Error: path is a required parameter."
 
         try:
             dp = self._resolve(path)

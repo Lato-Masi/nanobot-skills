@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from pathlib import Path
-from typing import Any
+from typing import Any, Dict, List, Optional
 
 from loguru import logger
 
@@ -24,7 +24,7 @@ class BaseChannel(ABC):
     display_name: str = "Base"
     transcription_api_key: str = ""
 
-    def __init__(self, config: Any, bus: MessageBus):
+    def __init__(self, config: Any, bus: MessageBus) -> None:
         """
         Initialize the channel.
 
@@ -34,7 +34,7 @@ class BaseChannel(ABC):
         """
         self.config = config
         self.bus = bus
-        self._running = False
+        self._running: bool = False
 
     async def transcribe_audio(self, file_path: str | Path) -> str:
         """Transcribe an audio file via Groq Whisper. Returns empty string on failure."""
@@ -78,7 +78,7 @@ class BaseChannel(ABC):
 
     def is_allowed(self, sender_id: str) -> bool:
         """Check if *sender_id* is permitted.  Empty list → deny all; ``"*"`` → allow all."""
-        allow_list = getattr(self.config, "allow_from", [])
+        allow_list: List[str] = getattr(self.config, "allow_from", [])
         if not allow_list:
             logger.warning("{}: allow_from is empty — all access denied", self.name)
             return False
@@ -91,9 +91,9 @@ class BaseChannel(ABC):
         sender_id: str,
         chat_id: str,
         content: str,
-        media: list[str] | None = None,
-        metadata: dict[str, Any] | None = None,
-        session_key: str | None = None,
+        media: Optional[List[str]] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+        session_key: Optional[str] = None,
     ) -> None:
         """
         Handle an incoming message from the chat platform.
@@ -112,7 +112,8 @@ class BaseChannel(ABC):
             logger.warning(
                 "Access denied for sender {} on channel {}. "
                 "Add them to allowFrom list in config to grant access.",
-                sender_id, self.name,
+                sender_id,
+                self.name,
             )
             return
 
@@ -129,7 +130,7 @@ class BaseChannel(ABC):
         await self.bus.publish_inbound(msg)
 
     @classmethod
-    def default_config(cls) -> dict[str, Any]:
+    def default_config(cls) -> Dict[str, Any]:
         """Return default config for onboard. Override in plugins to auto-populate config.json."""
         return {"enabled": False}
 

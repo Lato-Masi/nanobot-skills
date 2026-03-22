@@ -1,6 +1,6 @@
 """Tool registry for dynamic tool management."""
 
-from typing import Any
+from typing import Any, Dict, List, Optional
 
 from nanobot.agent.tools.base import Tool
 
@@ -12,8 +12,8 @@ class ToolRegistry:
     Allows dynamic registration and execution of tools.
     """
 
-    def __init__(self):
-        self._tools: dict[str, Tool] = {}
+    def __init__(self) -> None:
+        self._tools: Dict[str, Tool] = {}
 
     def register(self, tool: Tool) -> None:
         """Register a tool."""
@@ -23,7 +23,7 @@ class ToolRegistry:
         """Unregister a tool by name."""
         self._tools.pop(name, None)
 
-    def get(self, name: str) -> Tool | None:
+    def get(self, name: str) -> Optional[Tool]:
         """Get a tool by name."""
         return self._tools.get(name)
 
@@ -31,17 +31,17 @@ class ToolRegistry:
         """Check if a tool is registered."""
         return name in self._tools
 
-    def get_definitions(self) -> list[dict[str, Any]]:
+    def get_definitions(self) -> List[Dict[str, Any]]:
         """Get all tool definitions in OpenAI format."""
         return [tool.to_schema() for tool in self._tools.values()]
 
-    async def execute(self, name: str, params: dict[str, Any]) -> Any:
+    async def execute(self, name: str, params: Dict[str, Any]) -> Any:
         """Execute a tool by name with given parameters."""
         _HINT = "\n\n[Analyze the error above and try a different approach.]"
 
         tool = self._tools.get(name)
         if not tool:
-            return f"Error: Tool '{name}' not found. Available: {', '.join(self.tool_names)}"
+            return f'Error: Tool \'{name}\' not found. Available: {\', '.join(self.tool_names)}'
 
         try:
             # Attempt to cast parameters to match schema types
@@ -50,7 +50,7 @@ class ToolRegistry:
             # Validate parameters
             errors = tool.validate_params(casted_params)
             if errors:
-                return f"Error: Invalid parameters for tool '{name}': " + "; ".join(errors) + _HINT
+                return f'Error: Invalid parameters for tool \'{name}\': ' + "; ".join(errors) + _HINT
             result = await tool.execute(**casted_params)
             if isinstance(result, str) and result.startswith("Error"):
                 return result + _HINT
@@ -59,7 +59,7 @@ class ToolRegistry:
             return f"Error executing {name}: {str(e)}" + _HINT
 
     @property
-    def tool_names(self) -> list[str]:
+    def tool_names(self) -> List[str]:
         """Get list of registered tool names."""
         return list(self._tools.keys())
 

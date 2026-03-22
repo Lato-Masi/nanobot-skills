@@ -6,13 +6,20 @@ import asyncio
 import re
 import time
 import unicodedata
-from typing import Any, Literal
+from typing import Any, Dict, List, Literal, Optional, Tuple
 
 from loguru import logger
 from pydantic import Field
 from telegram import BotCommand, ReplyParameters, Update
 from telegram.error import TimedOut
-from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    ContextTypes,
+    MessageHandler,
+    filters,
+)
+from telegram.ext.filters import BaseFilter
 from telegram.request import HTTPXRequest
 
 from nanobot.bus.events import OutboundMessage
@@ -24,48 +31,50 @@ from nanobot.security.network import validate_url_target
 from nanobot.utils.helpers import split_message
 
 TELEGRAM_MAX_MESSAGE_LEN = 4000  # Telegram message character limit
-TELEGRAM_REPLY_CONTEXT_MAX_LEN = TELEGRAM_MAX_MESSAGE_LEN  # Max length for reply context in user message
+TELEGRAM_REPLY_CONTEXT_MAX_LEN = (
+    TELEGRAM_MAX_MESSAGE_LEN  # Max length for reply context in user message
+)
 
 
 def _strip_md(s: str) -> str:
     """Strip markdown inline formatting from text."""
-    s = re.sub(r'\*\*(.+?)\*\*', r'\1', s)
-    s = re.sub(r'__(.+?)__', r'\1', s)
-    s = re.sub(r'~~(.+?)~~', r'\1', s)
-    s = re.sub(r'`([^`]+)`', r'\1', s)
+    s = re.sub(r"\*\*(.+?)\*\*", r"\1", s)
+    s = re.sub(r"__(.+?)__", r"\1", s)
+    s = re.sub(r"~~(.+?)~~", r"\1", s)
+    s = re.sub(r"`([^`]+)`", r"\1", s)
     return s.strip()
 
 
-def _render_table_box(table_lines: list[str]) -> str:
+def _render_table_box(table_lines: List[str]) -> str:
     """Convert markdown pipe-table to compact aligned text for <pre> display."""
 
     def dw(s: str) -> int:
-        return sum(2 if unicodedata.east_asian_width(c) in ('W', 'F') else 1 for c in s)
+        return sum(2 if unicodedata.east_asian_width(c) in ("W", "F") else 1 for c in s)
 
-    rows: list[list[str]] = []
+    rows: List[List[str]] = []
     has_sep = False
     for line in table_lines:
-        cells = [_strip_md(c) for c in line.strip().strip('|').split('|')]
-        if all(re.match(r'^:?-+:?$', c) for c in cells if c):
+        cells = [_strip_md(c) for c in line.strip().strip("|").split("|")]
+        if all(re.match(r"^:?-+:?$", c) for c in cells if c):
             has_sep = True
             continue
         rows.append(cells)
     if not rows or not has_sep:
-        return '\n'.join(table_lines)
+        return "\n".join(table_lines)
 
     ncols = max(len(r) for r in rows)
     for r in rows:
-        r.extend([''] * (ncols - len(r)))
+        r.extend([""] * (ncols - len(r)))
     widths = [max(dw(r[c]) for r in rows) for c in range(ncols)]
 
-    def dr(cells: list[str]) -> str:
-        return '  '.join(f'{c}{" " * (w - dw(c))}' for c, w in zip(cells, widths))
+    def dr(cells: List[str]) -> str:
+        return "  ".join(f'{c}{" " * (w - dw(c))}' for c, w in zip(cells, widths))
 
     out = [dr(rows[0])]
-    out.append('  '.join('─' * w for w in widths))
+    out.append("  ".join("─" * w for w in widths))
     for row in rows[1:]:
         out.append(dr(row))
-    return '\n'.join(out)
+    return "\n".join(out)
 
 
 def _markdown_to_telegram_html(text: str) -> str:
@@ -76,25 +85,26 @@ def _markdown_to_telegram_html(text: str) -> str:
         return ""
 
     # 1. Extract and protect code blocks (preserve content from other processing)
-    code_blocks: list[str] = []
+    code_blocks: List[str] = []
+
     def save_code_block(m: re.Match) -> str:
         code_blocks.append(m.group(1))
         return f"\x00CB{len(code_blocks) - 1}\x00"
 
-    text = re.sub(r'```[\w]*\n?([\s\S]*?)```', save_code_block, text)
+    text = re.sub(r"```[\w]*\n?([\s\S]*?)```", save_code_block, text)
 
     # 1.5. Convert markdown tables to box-drawing (reuse code_block placeholders)
-    lines = text.split('\n')
-    rebuilt: list[str] = []
+    lines = text.split("\n")
+    rebuilt: List[str] = []
     li = 0
     while li < len(lines):
-        if re.match(r'^\s*\|.+\|', lines[li]):
-            tbl: list[str] = []
-            while li < len(lines) and re.match(r'^\s*\|.+\|', lines[li]):
+        if re.match(r"^\s*\|.+\|", lines[li]):
+            tbl: List[str] = []
+            while li < len(lines) and re.match(r"^\s*\|.+\|", lines[li]):
                 tbl.append(lines[li])
                 li += 1
             box = _render_table_box(tbl)
-            if box != '\n'.join(tbl):
+            if box != "\n".join(tbl):
                 code_blocks.append(box)
                 rebuilt.append(f"\x00CB{len(code_blocks) - 1}\x00")
             else:
@@ -102,21 +112,22 @@ def _markdown_to_telegram_html(text: str) -> str:
         else:
             rebuilt.append(lines[li])
             li += 1
-    text = '\n'.join(rebuilt)
+    text = "\n".join(rebuilt)
 
     # 2. Extract and protect inline code
-    inline_codes: list[str] = []
+    inline_codes: List[str] = []
+
     def save_inline_code(m: re.Match) -> str:
         inline_codes.append(m.group(1))
         return f"\x00IC{len(inline_codes) - 1}\x00"
 
-    text = re.sub(r'`([^`]+)`', save_inline_code, text)
+    text = re.sub(r"`([^`]+)`", save_inline_code, text)
 
     # 3. Headers # Title -> just the title text
-    text = re.sub(r'^#{1,6}\s+(.+)$', r'\1', text, flags=re.MULTILINE)
+    text = re.sub(r"^#{1,6}\s+(.+)$", r"\1", text, flags=re.MULTILINE)
 
     # 4. Blockquotes > text -> just the text (before HTML escaping)
-    text = re.sub(r'^>\s*(.*)$', r'\1', text, flags=re.MULTILINE)
+    text = re.sub(r"^>\s*(.*)$", r"\1", text, flags=re.MULTILINE)
 
     # 5. Escape HTML special characters
     text = text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
@@ -125,17 +136,17 @@ def _markdown_to_telegram_html(text: str) -> str:
     text = re.sub(r'\[([^\]]+)\]\(([^)]+)\)', r'<a href="\2">\1</a>', text)
 
     # 7. Bold **text** or __text__
-    text = re.sub(r'\*\*(.+?)\*\*', r'<b>\1</b>', text)
-    text = re.sub(r'__(.+?)__', r'<b>\1</b>', text)
+    text = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", text)
+    text = re.sub(r"__(.+?)__", r"<b>\1</b>", text)
 
     # 8. Italic _text_ (avoid matching inside words like some_var_name)
-    text = re.sub(r'(?<![a-zA-Z0-9])_([^_]+)_(?![a-zA-Z0-9])', r'<i>\1</i>', text)
+    text = re.sub(r"(?<![a-zA-Z0-9])_([^_]+)_(?![a-zA-Z0-9])", r"<i>\1</i>", text)
 
     # 9. Strikethrough ~~text~~
-    text = re.sub(r'~~(.+?)~~', r'<s>\1</s>', text)
+    text = re.sub(r"~~(.+?)~~", r"<s>\1</s>", text)
 
     # 10. Bullet lists - item -> • item
-    text = re.sub(r'^[-*]\s+', '• ', text, flags=re.MULTILINE)
+    text = re.sub(r"^[-*]\s+", "• ", text, flags=re.MULTILINE)
 
     # 11. Restore inline code with HTML tags
     for i, code in enumerate(inline_codes):
@@ -147,7 +158,7 @@ def _markdown_to_telegram_html(text: str) -> str:
     for i, code in enumerate(code_blocks):
         # Escape HTML in code content
         escaped = code.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-        text = text.replace(f"\x00CB{i}\x00", f"<pre><code>{escaped}</code></pre>")
+        text = text.replace(f"\x00CB{i}\x00", f'<pre><code class="language-python">{escaped}</code></pre>')
 
     return text
 
@@ -161,8 +172,8 @@ class TelegramConfig(Base):
 
     enabled: bool = False
     token: str = ""
-    allow_from: list[str] = Field(default_factory=list)
-    proxy: str | None = None
+    allow_from: List[str] = Field(default_factory=list)
+    proxy: Optional[str] = None
     reply_to_message: bool = False
     group_policy: Literal["open", "mention"] = "mention"
     connection_pool_size: int = 32
@@ -180,7 +191,7 @@ class TelegramChannel(BaseChannel):
     display_name = "Telegram"
 
     # Commands registered with Telegram's command menu
-    BOT_COMMANDS = [
+    BOT_COMMANDS: List[BotCommand] = [
         BotCommand("start", "Start the bot"),
         BotCommand("new", "Start a new conversation"),
         BotCommand("stop", "Stop the current task"),
@@ -190,29 +201,29 @@ class TelegramChannel(BaseChannel):
     ]
 
     @classmethod
-    def default_config(cls) -> dict[str, Any]:
+    def default_config(cls) -> Dict[str, Any]:
         return TelegramConfig().model_dump(by_alias=True)
 
-    def __init__(self, config: Any, bus: MessageBus):
+    def __init__(self, config: Any, bus: MessageBus) -> None:
         if isinstance(config, dict):
             config = TelegramConfig.model_validate(config)
         super().__init__(config, bus)
         self.config: TelegramConfig = config
-        self._app: Application | None = None
-        self._chat_ids: dict[str, int] = {}  # Map sender_id to chat_id for replies
-        self._typing_tasks: dict[str, asyncio.Task] = {}  # chat_id -> typing loop task
-        self._media_group_buffers: dict[str, dict] = {}
-        self._media_group_tasks: dict[str, asyncio.Task] = {}
-        self._message_threads: dict[tuple[str, int], int] = {}
-        self._bot_user_id: int | None = None
-        self._bot_username: str | None = None
+        self._app: Optional[Application] = None
+        self._chat_ids: Dict[str, int] = {}  # Map sender_id to chat_id for replies
+        self._typing_tasks: Dict[str, asyncio.Task] = {}  # chat_id -> typing loop task
+        self._media_group_buffers: Dict[str, Dict[str, Any]] = {}
+        self._media_group_tasks: Dict[str, asyncio.Task] = {}
+        self._message_threads: Dict[Tuple[str, int], int] = {}
+        self._bot_user_id: Optional[int] = None
+        self._bot_username: Optional[str] = None
 
     def is_allowed(self, sender_id: str) -> bool:
         """Preserve Telegram's legacy id|username allowlist matching."""
         if super().is_allowed(sender_id):
             return True
 
-        allow_list = getattr(self.config, "allow_from", [])
+        allow_list: List[str] = getattr(self.config, "allow_from", [])
         if not allow_list or "*" in allow_list:
             return False
 
@@ -234,7 +245,7 @@ class TelegramChannel(BaseChannel):
 
         self._running = True
 
-        proxy = self.config.proxy or None
+        proxy: Optional[str] = self.config.proxy or None
 
         # Separate pools so long-polling (getUpdates) never starves outbound sends.
         api_request = HTTPXRequest(
@@ -242,14 +253,14 @@ class TelegramChannel(BaseChannel):
             pool_timeout=self.config.pool_timeout,
             connect_timeout=30.0,
             read_timeout=30.0,
-            proxy=proxy,
+            proxy_url=proxy,
         )
         poll_request = HTTPXRequest(
             connection_pool_size=4,
             pool_timeout=self.config.pool_timeout,
             connect_timeout=30.0,
             read_timeout=30.0,
-            proxy=proxy,
+            proxy_url=proxy,
         )
         builder = (
             Application.builder()
@@ -269,13 +280,14 @@ class TelegramChannel(BaseChannel):
         self._app.add_handler(CommandHandler("help", self._on_help))
 
         # Add message handler for text, photos, voice, documents
-        self._app.add_handler(
-            MessageHandler(
-                (filters.TEXT | filters.PHOTO | filters.VOICE | filters.AUDIO | filters.Document.ALL)
-                & ~filters.COMMAND,
-                self._on_message
-            )
-        )
+        message_filter: BaseFilter = (
+            filters.TEXT
+            | filters.PHOTO
+            | filters.VOICE
+            | filters.AUDIO
+            | filters.Document.ALL
+        ) & ~filters.COMMAND
+        self._app.add_handler(MessageHandler(message_filter, self._on_message))
 
         logger.info("Starting Telegram bot (polling mode)...")
 
@@ -296,10 +308,11 @@ class TelegramChannel(BaseChannel):
             logger.warning("Failed to register bot commands: {}", e)
 
         # Start polling (this runs until stopped)
-        await self._app.updater.start_polling(
-            allowed_updates=["message"],
-            drop_pending_updates=True  # Ignore old messages on startup
-        )
+        if self._app.updater:
+            await self._app.updater.start_polling(
+                allowed_updates=["message"],
+                drop_pending_updates=True,  # Ignore old messages on startup
+            )
 
         # Keep running until stopped
         while self._running:
@@ -320,7 +333,8 @@ class TelegramChannel(BaseChannel):
 
         if self._app:
             logger.info("Stopping Telegram bot...")
-            await self._app.updater.stop()
+            if self._app.updater:
+                await self._app.updater.stop()
             await self._app.stop()
             await self._app.shutdown()
             self._app = None
@@ -348,7 +362,7 @@ class TelegramChannel(BaseChannel):
             return
 
         # Only stop typing indicator for final responses
-        if not msg.metadata.get("_progress", False):
+        if not msg.metadata or not msg.metadata.get("_progress", False):
             self._stop_typing(msg.chat_id)
 
         try:
@@ -356,24 +370,29 @@ class TelegramChannel(BaseChannel):
         except ValueError:
             logger.error("Invalid chat_id: {}", msg.chat_id)
             return
-        reply_to_message_id = msg.metadata.get("message_id")
-        message_thread_id = msg.metadata.get("message_thread_id")
+
+        reply_to_message_id: Optional[int] = (
+            msg.metadata.get("message_id") if msg.metadata else None
+        )
+        message_thread_id: Optional[int] = (
+            msg.metadata.get("message_thread_id") if msg.metadata else None
+        )
         if message_thread_id is None and reply_to_message_id is not None:
             message_thread_id = self._message_threads.get((msg.chat_id, reply_to_message_id))
-        thread_kwargs = {}
+
+        thread_kwargs: Dict[str, Any] = {}
         if message_thread_id is not None:
             thread_kwargs["message_thread_id"] = message_thread_id
 
-        reply_params = None
+        reply_params: Optional[ReplyParameters] = None
         if self.config.reply_to_message:
             if reply_to_message_id:
                 reply_params = ReplyParameters(
-                    message_id=reply_to_message_id,
-                    allow_sending_without_reply=True
+                    message_id=reply_to_message_id, allow_sending_without_reply=True
                 )
 
         # Send media files
-        for media_path in (msg.media or []):
+        for media_path in msg.media or []:
             try:
                 media_type = self._get_media_type(media_path)
                 sender = {
@@ -381,7 +400,13 @@ class TelegramChannel(BaseChannel):
                     "voice": self._app.bot.send_voice,
                     "audio": self._app.bot.send_audio,
                 }.get(media_type, self._app.bot.send_document)
-                param = "photo" if media_type == "photo" else media_type if media_type in ("voice", "audio") else "document"
+                param = (
+                    "photo"
+                    if media_type == "photo"
+                    else media_type
+                    if media_type in ("voice", "audio")
+                    else "document"
+                )
 
                 # Telegram Bot API accepts HTTP(S) URLs directly for media params.
                 if self._is_remote_media_url(media_path):
@@ -398,7 +423,8 @@ class TelegramChannel(BaseChannel):
                     continue
 
                 with open(media_path, "rb") as f:
-                    await sender(
+                    await self._call_with_retry(
+                        sender,
                         chat_id=chat_id,
                         **{param: f},
                         reply_parameters=reply_params,
@@ -407,7 +433,8 @@ class TelegramChannel(BaseChannel):
             except Exception as e:
                 filename = media_path.rsplit("/", 1)[-1]
                 logger.error("Failed to send media {}: {}", media_path, e)
-                await self._app.bot.send_message(
+                await self._call_with_retry(
+                    self._app.bot.send_message,
                     chat_id=chat_id,
                     text=f"[Failed to send: {filename}]",
                     reply_parameters=reply_params,
@@ -416,7 +443,7 @@ class TelegramChannel(BaseChannel):
 
         # Send text content
         if msg.content and msg.content != "[empty message]":
-            is_progress = msg.metadata.get("_progress", False)
+            is_progress = bool(msg.metadata and msg.metadata.get("_progress", False))
 
             for chunk in split_message(msg.content, TELEGRAM_MAX_MESSAGE_LEN):
                 # Final response: simulate streaming via draft, then persist.
@@ -425,7 +452,7 @@ class TelegramChannel(BaseChannel):
                 else:
                     await self._send_text(chat_id, chunk, reply_params, thread_kwargs)
 
-    async def _call_with_retry(self, fn, *args, **kwargs):
+    async def _call_with_retry(self, fn: Any, *args: Any, **kwargs: Any) -> Any:
         """Call an async Telegram API function with retry on pool/network timeout."""
         for attempt in range(1, _SEND_MAX_RETRIES + 1):
             try:
@@ -436,23 +463,30 @@ class TelegramChannel(BaseChannel):
                 delay = _SEND_RETRY_BASE_DELAY * (2 ** (attempt - 1))
                 logger.warning(
                     "Telegram timeout (attempt {}/{}), retrying in {:.1f}s",
-                    attempt, _SEND_MAX_RETRIES, delay,
+                    attempt,
+                    _SEND_MAX_RETRIES,
+                    delay,
                 )
                 await asyncio.sleep(delay)
+        return None
 
     async def _send_text(
         self,
         chat_id: int,
         text: str,
-        reply_params=None,
-        thread_kwargs: dict | None = None,
+        reply_params: Optional[ReplyParameters] = None,
+        thread_kwargs: Optional[Dict[str, Any]] = None,
     ) -> None:
         """Send a plain text message with HTML fallback."""
+        if not self._app:
+            return
         try:
             html = _markdown_to_telegram_html(text)
             await self._call_with_retry(
                 self._app.bot.send_message,
-                chat_id=chat_id, text=html, parse_mode="HTML",
+                chat_id=chat_id,
+                text=html,
+                parse_mode="HTML",
                 reply_parameters=reply_params,
                 **(thread_kwargs or {}),
             )
@@ -473,21 +507,26 @@ class TelegramChannel(BaseChannel):
         self,
         chat_id: int,
         text: str,
-        reply_params=None,
-        thread_kwargs: dict | None = None,
+        reply_params: Optional[ReplyParameters] = None,
+        thread_kwargs: Optional[Dict[str, Any]] = None,
     ) -> None:
         """Simulate streaming via send_message_draft, then persist with send_message."""
+        if not self._app:
+            return
+
         draft_id = int(time.time() * 1000) % (2**31)
         try:
             step = max(len(text) // 8, 40)
             for i in range(step, len(text), step):
-                await self._app.bot.send_message_draft(
-                    chat_id=chat_id, draft_id=draft_id, text=text[:i],
-                )
+                if self._app and self._app.bot:
+                    await self._app.bot.send_message_draft(
+                        chat_id=chat_id, draft_id=draft_id, text=text[:i]
+                    )
                 await asyncio.sleep(0.04)
-            await self._app.bot.send_message_draft(
-                chat_id=chat_id, draft_id=draft_id, text=text,
-            )
+            if self._app and self._app.bot:
+                await self._app.bot.send_message_draft(
+                    chat_id=chat_id, draft_id=draft_id, text=text
+                )
             await asyncio.sleep(0.15)
         except Exception:
             pass
@@ -519,13 +558,13 @@ class TelegramChannel(BaseChannel):
         )
 
     @staticmethod
-    def _sender_id(user) -> str:
+    def _sender_id(user: Any) -> str:
         """Build sender_id with username for allowlist matching."""
         sid = str(user.id)
         return f"{sid}|{user.username}" if user.username else sid
 
     @staticmethod
-    def _derive_topic_session_key(message) -> str | None:
+    def _derive_topic_session_key(message: Any) -> Optional[str]:
         """Derive topic-scoped session key for non-private Telegram chats."""
         message_thread_id = getattr(message, "message_thread_id", None)
         if message.chat.type == "private" or message_thread_id is None:
@@ -533,7 +572,7 @@ class TelegramChannel(BaseChannel):
         return f"telegram:{message.chat_id}:topic:{message_thread_id}"
 
     @staticmethod
-    def _build_message_metadata(message, user) -> dict:
+    def _build_message_metadata(message: Any, user: Any) -> Dict[str, Any]:
         """Build common Telegram inbound metadata payload."""
         reply_to = getattr(message, "reply_to_message", None)
         return {
@@ -548,22 +587,22 @@ class TelegramChannel(BaseChannel):
         }
 
     @staticmethod
-    def _extract_reply_context(message) -> str | None:
+    def _extract_reply_context(message: Any) -> Optional[str]:
         """Extract text from the message being replied to, if any."""
         reply = getattr(message, "reply_to_message", None)
         if not reply:
             return None
-        text = getattr(reply, "text", None) or getattr(reply, "caption", None) or ""
+        text: str = getattr(reply, "text", None) or getattr(reply, "caption", None) or ""
         if len(text) > TELEGRAM_REPLY_CONTEXT_MAX_LEN:
             text = text[:TELEGRAM_REPLY_CONTEXT_MAX_LEN] + "..."
         return f"[Reply to: {text}]" if text else None
 
     async def _download_message_media(
-        self, msg, *, add_failure_content: bool = False
-    ) -> tuple[list[str], list[str]]:
+        self, msg: Any, *, add_failure_content: bool = False
+    ) -> Tuple[List[str], List[str]]:
         """Download media from a message (current or reply). Returns (media_paths, content_parts)."""
-        media_file = None
-        media_type = None
+        media_file: Optional[Any] = None
+        media_type: Optional[str] = None
         if getattr(msg, "photo", None):
             media_file = msg.photo[-1]
             media_type = "image"
@@ -585,8 +624,10 @@ class TelegramChannel(BaseChannel):
         elif getattr(msg, "animation", None):
             media_file = msg.animation
             media_type = "animation"
+
         if not media_file or not self._app:
             return [], []
+
         try:
             file = await self._app.bot.get_file(media_file.file_id)
             ext = self._get_extension(
@@ -597,7 +638,7 @@ class TelegramChannel(BaseChannel):
             media_dir = get_media_dir("telegram")
             unique_id = getattr(media_file, "file_unique_id", media_file.file_id)
             file_path = media_dir / f"{unique_id}{ext}"
-            await file.download_to_drive(str(file_path))
+            await file.download_to_drive(file_path)
             path_str = str(file_path)
             if media_type in ("voice", "audio"):
                 transcription = await self.transcribe_audio(file_path)
@@ -612,7 +653,7 @@ class TelegramChannel(BaseChannel):
                 return [], [f"[{media_type}: download failed]"]
             return [], []
 
-    async def _ensure_bot_identity(self) -> tuple[int | None, str | None]:
+    async def _ensure_bot_identity(self) -> Tuple[Optional[int], Optional[str]]:
         """Load bot identity once and reuse it for mention/reply checks."""
         if self._bot_user_id is not None or self._bot_username is not None:
             return self._bot_user_id, self._bot_username
@@ -626,9 +667,9 @@ class TelegramChannel(BaseChannel):
     @staticmethod
     def _has_mention_entity(
         text: str,
-        entities,
+        entities: Optional[List[Any]],
         bot_username: str,
-        bot_id: int | None,
+        bot_id: Optional[int],
     ) -> bool:
         """Check Telegram mention entities against the bot username."""
         handle = f"@{bot_username}".lower()
@@ -649,15 +690,15 @@ class TelegramChannel(BaseChannel):
                 return True
         return handle in text.lower()
 
-    async def _is_group_message_for_bot(self, message) -> bool:
+    async def _is_group_message_for_bot(self, message: Any) -> bool:
         """Allow group messages when policy is open, @mentioned, or replying to the bot."""
         if message.chat.type == "private" or self.config.group_policy == "open":
             return True
 
         bot_id, bot_username = await self._ensure_bot_identity()
         if bot_username:
-            text = message.text or ""
-            caption = message.caption or ""
+            text: str = message.text or ""
+            caption: str = message.caption or ""
             if self._has_mention_entity(
                 text,
                 getattr(message, "entities", None),
@@ -676,7 +717,7 @@ class TelegramChannel(BaseChannel):
         reply_user = getattr(getattr(message, "reply_to_message", None), "from_user", None)
         return bool(bot_id and reply_user and reply_user.id == bot_id)
 
-    def _remember_thread_context(self, message) -> None:
+    def _remember_thread_context(self, message: Any) -> None:
         """Cache topic thread id by chat/message id for follow-up replies."""
         message_thread_id = getattr(message, "message_thread_id", None)
         if message_thread_id is None:
@@ -719,8 +760,8 @@ class TelegramChannel(BaseChannel):
             return
 
         # Build content from text and/or media
-        content_parts = []
-        media_paths = []
+        content_parts: List[str] = []
+        media_paths: List[str] = []
 
         # Text content
         if message.text:
@@ -745,7 +786,10 @@ class TelegramChannel(BaseChannel):
             if reply_media:
                 media_paths = reply_media + media_paths
                 logger.debug("Attached replied-to media: {}", reply_media[0])
-            tag = reply_ctx or (f"[Reply to: {reply_media_parts[0]}]" if reply_media_parts else None)
+            tag = (
+                reply_ctx
+                or (f"[Reply to: {reply_media_parts[0]}]" if reply_media_parts else None)
+            )
             if tag:
                 content_parts.insert(0, tag)
         content = "\n".join(content_parts) if content_parts else "[empty message]"
@@ -757,12 +801,15 @@ class TelegramChannel(BaseChannel):
         session_key = self._derive_topic_session_key(message)
 
         # Telegram media groups: buffer briefly, forward as one aggregated turn.
-        if media_group_id := getattr(message, "media_group_id", None):
+        media_group_id: Optional[str] = getattr(message, "media_group_id", None)
+        if media_group_id:
             key = f"{str_chat_id}:{media_group_id}"
             if key not in self._media_group_buffers:
                 self._media_group_buffers[key] = {
-                    "sender_id": sender_id, "chat_id": str_chat_id,
-                    "contents": [], "media": [],
+                    "sender_id": sender_id,
+                    "chat_id": str_chat_id,
+                    "contents": [],
+                    "media": [],
                     "metadata": metadata,
                     "session_key": session_key,
                 }
@@ -772,7 +819,9 @@ class TelegramChannel(BaseChannel):
                 buf["contents"].append(content)
             buf["media"].extend(media_paths)
             if key not in self._media_group_tasks:
-                self._media_group_tasks[key] = asyncio.create_task(self._flush_media_group(key))
+                self._media_group_tasks[key] = asyncio.create_task(
+                    self._flush_media_group(key)
+                )
             return
 
         # Start typing indicator before processing
@@ -792,12 +841,15 @@ class TelegramChannel(BaseChannel):
         """Wait briefly, then forward buffered media-group as one turn."""
         try:
             await asyncio.sleep(0.6)
-            if not (buf := self._media_group_buffers.pop(key, None)):
+            buf = self._media_group_buffers.pop(key, None)
+            if not buf:
                 return
             content = "\n".join(buf["contents"]) or "[empty message]"
             await self._handle_message(
-                sender_id=buf["sender_id"], chat_id=buf["chat_id"],
-                content=content, media=list(dict.fromkeys(buf["media"])),
+                sender_id=buf["sender_id"],
+                chat_id=buf["chat_id"],
+                content=content,
+                media=list(dict.fromkeys(buf["media"])),
                 metadata=buf["metadata"],
                 session_key=buf.get("session_key"),
             )
@@ -834,19 +886,23 @@ class TelegramChannel(BaseChannel):
     def _get_extension(
         self,
         media_type: str,
-        mime_type: str | None,
-        filename: str | None = None,
+        mime_type: Optional[str],
+        filename: Optional[str] = None,
     ) -> str:
         """Get file extension based on media type or original filename."""
         if mime_type:
-            ext_map = {
-                "image/jpeg": ".jpg", "image/png": ".png", "image/gif": ".gif",
-                "audio/ogg": ".ogg", "audio/mpeg": ".mp3", "audio/mp4": ".m4a",
+            ext_map: Dict[str, str] = {
+                "image/jpeg": ".jpg",
+                "image/png": ".png",
+                "image/gif": ".gif",
+                "audio/ogg": ".ogg",
+                "audio/mpeg": ".mp3",
+                "audio/mp4": ".m4a",
             }
             if mime_type in ext_map:
                 return ext_map[mime_type]
 
-        type_map = {"image": ".jpg", "voice": ".ogg", "audio": ".mp3", "file": ""}
+        type_map: Dict[str, str] = {"image": ".jpg", "voice": ".ogg", "audio": ".mp3", "file": ""}
         if ext := type_map.get(media_type, ""):
             return ext
 

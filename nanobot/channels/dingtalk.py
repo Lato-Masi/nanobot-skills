@@ -6,7 +6,7 @@ import mimetypes
 import os
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Dict, List, Optional, Set, Tuple
 from urllib.parse import unquote, urlparse
 
 import httpx
@@ -36,6 +36,8 @@ except ImportError:
     CallbackMessage = None  # type: ignore[assignment,misc]
     AckMessage = None  # type: ignore[assignment,misc]
     ChatbotMessage = None  # type: ignore[assignment,misc]
+    DingTalkStreamClient = None  # type: ignore[assignment,misc]
+    Credential = None  # type: ignore[assignment,misc]
 
 
 class NanobotDingTalkHandler(CallbackHandler):
@@ -48,14 +50,14 @@ class NanobotDingTalkHandler(CallbackHandler):
         super().__init__()
         self.channel = channel
 
-    async def process(self, message: CallbackMessage):
+    async def process(self, message: CallbackMessage) -> Tuple[str, str]:
         """Process incoming stream message."""
         try:
             # Parse using SDK's ChatbotMessage for robust handling
             chatbot_msg = ChatbotMessage.from_dict(message.data)
 
             # Extract text content; fall back to raw dict if SDK object is empty
-            content = ""
+            content: str = ""
             if chatbot_msg.text:
                 content = chatbot_msg.text.content.strip()
             elif chatbot_msg.extensions.get("content", {}).get("recognition"):
@@ -64,19 +66,27 @@ class NanobotDingTalkHandler(CallbackHandler):
                 content = message.data.get("text", {}).get("content", "").strip()
 
             # Handle file/image messages
-            file_paths = []
+            file_paths: List[str] = []
             if chatbot_msg.message_type == "picture" and chatbot_msg.image_content:
                 download_code = chatbot_msg.image_content.download_code
                 if download_code:
                     sender_uid = chatbot_msg.sender_staff_id or chatbot_msg.sender_id or "unknown"
-                    fp = await self.channel._download_dingtalk_file(download_code, "image.jpg", sender_uid)
+                    fp = await self.channel._download_dingtalk_file(
+                        download_code, "image.jpg", sender_uid
+                    )
                     if fp:
                         file_paths.append(fp)
                         content = content or "[Image]"
 
             elif chatbot_msg.message_type == "file":
-                download_code = message.data.get("content", {}).get("downloadCode") or message.data.get("downloadCode")
-                fname = message.data.get("content", {}).get("fileName") or message.data.get("fileName") or "file"
+                download_code = message.data.get("content", {}).get(
+                    "downloadCode"
+                ) or message.data.get("downloadCode")
+                fname = (
+                    message.data.get("content", {}).get("fileName")
+                    or message.data.get("fileName")
+                    or "file"
+                )
                 if download_code:
                     sender_uid = chatbot_msg.sender_staff_id or chatbot_msg.sender_id or "unknown"
                     fp = await self.channel._download_dingtalk_file(download_code, fname, sender_uid)
@@ -96,7 +106,9 @@ class NanobotDingTalkHandler(CallbackHandler):
                     elif item.get("downloadCode"):
                         dc = item["downloadCode"]
                         fname = item.get("fileName") or "file"
-                        sender_uid = chatbot_msg.sender_staff_id or chatbot_msg.sender_id or "unknown"
+                        sender_uid = (
+                            chatbot_msg.sender_staff_id or chatbot_msg.sender_id or "unknown"
+                        )
                         fp = await self.channel._download_dingtalk_file(dc, fname, sender_uid)
                         if fp:
                             file_paths.append(fp)
@@ -117,12 +129,13 @@ class NanobotDingTalkHandler(CallbackHandler):
             sender_name = chatbot_msg.sender_nick or "Unknown"
 
             conversation_type = message.data.get("conversationType")
-            conversation_id = (
-                message.data.get("conversationId")
-                or message.data.get("openConversationId")
+            conversation_id = message.data.get("conversationId") or message.data.get(
+                "openConversationId"
             )
 
-            logger.info("Received DingTalk message from {} ({}): {}", sender_name, sender_id, content)
+            logger.info(
+                "Received DingTalk message from {} ({}): {}", sender_name, sender_id, content
+            )
 
             # Forward to Nanobot via _on_message (non-blocking).
             # Store reference to prevent GC before task completes.
@@ -152,7 +165,7 @@ class DingTalkConfig(Base):
     enabled: bool = False
     client_id: str = ""
     client_secret: str = ""
-    allow_from: list[str] = Field(default_factory=list)
+    allow_from: List[str] = Field(default_factory=list)
 
 
 class DingTalkChannel(BaseChannel):
@@ -168,28 +181,28 @@ class DingTalkChannel(BaseChannel):
 
     name = "dingtalk"
     display_name = "DingTalk"
-    _IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp"}
-    _AUDIO_EXTS = {".amr", ".mp3", ".wav", ".ogg", ".m4a", ".aac"}
-    _VIDEO_EXTS = {".mp4", ".mov", ".avi", ".mkv", ".webm"}
+    _IMAGE_EXTS: Set[str] = {".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp"}
+    _AUDIO_EXTS: Set[str] = {".amr", ".mp3", ".wav", ".ogg", ".m4a", ".aac"}
+    _VIDEO_EXTS: Set[str] = {".mp4", ".mov", ".avi", ".mkv", ".webm"}
 
     @classmethod
-    def default_config(cls) -> dict[str, Any]:
+    def default_config(cls) -> Dict[str, Any]:
         return DingTalkConfig().model_dump(by_alias=True)
 
-    def __init__(self, config: Any, bus: MessageBus):
+    def __init__(self, config: Any, bus: MessageBus) -> None:
         if isinstance(config, dict):
             config = DingTalkConfig.model_validate(config)
         super().__init__(config, bus)
         self.config: DingTalkConfig = config
-        self._client: Any = None
-        self._http: httpx.AsyncClient | None = None
+        self._client: Optional[DingTalkStreamClient] = None
+        self._http: Optional[httpx.AsyncClient] = None
 
         # Access Token management for sending messages
-        self._access_token: str | None = None
+        self._access_token: Optional[str] = None
         self._token_expiry: float = 0
 
         # Hold references to background tasks to prevent GC
-        self._background_tasks: set[asyncio.Task] = set()
+        self._background_tasks: Set[asyncio.Task] = set()
 
     async def start(self) -> None:
         """Start the DingTalk bot with Stream Mode."""
@@ -245,7 +258,7 @@ class DingTalkChannel(BaseChannel):
             task.cancel()
         self._background_tasks.clear()
 
-    async def _get_access_token(self) -> str | None:
+    async def _get_access_token(self) -> Optional[str]:
         """Get or refresh Access Token."""
         if self._access_token and time.time() < self._token_expiry:
             return self._access_token
@@ -263,7 +276,7 @@ class DingTalkChannel(BaseChannel):
         try:
             resp = await self._http.post(url, json=data)
             resp.raise_for_status()
-            res_data = resp.json()
+            res_data: Dict[str, Any] = resp.json()
             self._access_token = res_data.get("accessToken")
             # Expire 60s early to be safe
             self._token_expiry = time.time() + int(res_data.get("expireIn", 7200)) - 60
@@ -278,19 +291,24 @@ class DingTalkChannel(BaseChannel):
 
     def _guess_upload_type(self, media_ref: str) -> str:
         ext = Path(urlparse(media_ref).path).suffix.lower()
-        if ext in self._IMAGE_EXTS: return "image"
-        if ext in self._AUDIO_EXTS: return "voice"
-        if ext in self._VIDEO_EXTS: return "video"
+        if ext in self._IMAGE_EXTS:
+            return "image"
+        if ext in self._AUDIO_EXTS:
+            return "voice"
+        if ext in self._VIDEO_EXTS:
+            return "video"
         return "file"
 
     def _guess_filename(self, media_ref: str, upload_type: str) -> str:
         name = os.path.basename(urlparse(media_ref).path)
-        return name or {"image": "image.jpg", "voice": "audio.amr", "video": "video.mp4"}.get(upload_type, "file.bin")
+        return name or {"image": "image.jpg", "voice": "audio.amr", "video": "video.mp4"}.get(
+            upload_type, "file.bin"
+        )
 
     async def _read_media_bytes(
         self,
         media_ref: str,
-    ) -> tuple[bytes | None, str | None, str | None]:
+    ) -> Tuple[Optional[bytes], Optional[str], Optional[str]]:
         if not media_ref:
             return None, None, None
 
@@ -335,8 +353,8 @@ class DingTalkChannel(BaseChannel):
         data: bytes,
         media_type: str,
         filename: str,
-        content_type: str | None,
-    ) -> str | None:
+        content_type: Optional[str],
+    ) -> Optional[str]:
         if not self._http:
             return None
         url = f"https://oapi.dingtalk.com/media/upload?access_token={token}&type={media_type}"
@@ -346,16 +364,33 @@ class DingTalkChannel(BaseChannel):
         try:
             resp = await self._http.post(url, files=files)
             text = resp.text
-            result = resp.json() if resp.headers.get("content-type", "").startswith("application/json") else {}
+            result: Dict[str, Any] = (
+                resp.json() if resp.headers.get("content-type", "").startswith("application/json") else {}
+            )
             if resp.status_code >= 400:
-                logger.error("DingTalk media upload failed status={} type={} body={}", resp.status_code, media_type, text[:500])
+                logger.error(
+                    "DingTalk media upload failed status={} type={} body={}",
+                    resp.status_code,
+                    media_type,
+                    text[:500],
+                )
                 return None
             errcode = result.get("errcode", 0)
             if errcode != 0:
-                logger.error("DingTalk media upload api error type={} errcode={} body={}", media_type, errcode, text[:500])
+                logger.error(
+                    "DingTalk media upload api error type={} errcode={} body={}",
+                    media_type,
+                    errcode,
+                    text[:500],
+                )
                 return None
-            sub = result.get("result") or {}
-            media_id = result.get("media_id") or result.get("mediaId") or sub.get("media_id") or sub.get("mediaId")
+            sub: Dict[str, Any] = result.get("result") or {}
+            media_id: Optional[str] = (
+                result.get("media_id")
+                or result.get("mediaId")
+                or sub.get("media_id")
+                or sub.get("mediaId")
+            )
             if not media_id:
                 logger.error("DingTalk media upload missing media_id body={}", text[:500])
                 return None
@@ -369,13 +404,14 @@ class DingTalkChannel(BaseChannel):
         token: str,
         chat_id: str,
         msg_key: str,
-        msg_param: dict[str, Any],
+        msg_param: Dict[str, Any],
     ) -> bool:
         if not self._http:
             logger.warning("DingTalk HTTP client not initialized, cannot send")
             return False
 
         headers = {"x-acs-dingtalk-access-token": token}
+        payload: Dict[str, Any]
         if chat_id.startswith("group:"):
             # Group chat
             url = "https://api.dingtalk.com/v1.0/robot/groupMessages/send"
@@ -399,13 +435,22 @@ class DingTalkChannel(BaseChannel):
             resp = await self._http.post(url, json=payload, headers=headers)
             body = resp.text
             if resp.status_code != 200:
-                logger.error("DingTalk send failed msgKey={} status={} body={}", msg_key, resp.status_code, body[:500])
+                logger.error(
+                    "DingTalk send failed msgKey={} status={} body={}",
+                    msg_key,
+                    resp.status_code,
+                    body[:500],
+                )
                 return False
-            try: result = resp.json()
-            except Exception: result = {}
+            try:
+                result: Dict[str, Any] = resp.json()
+            except Exception:
+                result = {}
             errcode = result.get("errcode")
             if errcode not in (None, 0):
-                logger.error("DingTalk send api error msgKey={} errcode={} body={}", msg_key, errcode, body[:500])
+                logger.error(
+                    "DingTalk send api error msgKey={} errcode={} body={}", msg_key, errcode, body[:500]
+                )
                 return False
             logger.debug("DingTalk message sent to {} with msgKey={}", chat_id, msg_key)
             return True
@@ -471,7 +516,9 @@ class DingTalkChannel(BaseChannel):
             )
             if ok:
                 return True
-            logger.warning("DingTalk image media_id send failed, falling back to file: {}", media_ref)
+            logger.warning(
+                "DingTalk image media_id send failed, falling back to file: {}", media_ref
+            )
 
         return await self._send_batch_message(
             token,
@@ -507,8 +554,8 @@ class DingTalkChannel(BaseChannel):
         content: str,
         sender_id: str,
         sender_name: str,
-        conversation_type: str | None = None,
-        conversation_id: str | None = None,
+        conversation_type: Optional[str] = None,
+        conversation_id: Optional[str] = None,
     ) -> None:
         """Handle incoming message (called by NanobotDingTalkHandler).
 
@@ -537,7 +584,7 @@ class DingTalkChannel(BaseChannel):
         download_code: str,
         filename: str,
         sender_id: str,
-    ) -> str | None:
+    ) -> Optional[str]:
         """Download a DingTalk file to the media directory, return local path."""
         from nanobot.config.paths import get_media_dir
 
@@ -549,14 +596,21 @@ class DingTalkChannel(BaseChannel):
 
             # Step 1: Exchange downloadCode for a temporary download URL
             api_url = "https://api.dingtalk.com/v1.0/robot/messageFiles/download"
-            headers = {"x-acs-dingtalk-access-token": token, "Content-Type": "application/json"}
+            headers: Dict[str, str] = {
+                "x-acs-dingtalk-access-token": token,
+                "Content-Type": "application/json",
+            }
             payload = {"downloadCode": download_code, "robotCode": self.config.client_id}
             resp = await self._http.post(api_url, json=payload, headers=headers)
             if resp.status_code != 200:
-                logger.error("DingTalk get download URL failed: status={}, body={}", resp.status_code, resp.text)
+                logger.error(
+                    "DingTalk get download URL failed: status={}, body={}",
+                    resp.status_code,
+                    resp.text,
+                )
                 return None
 
-            result = resp.json()
+            result: Dict[str, Any] = resp.json()
             download_url = result.get("downloadUrl")
             if not download_url:
                 logger.error("DingTalk download URL not found in response: {}", result)

@@ -2,9 +2,10 @@
 
 import asyncio
 import re
-from typing import Any
+from typing import Any, Dict, List, Optional
 
 from loguru import logger
+from pydantic import Field
 from slack_sdk.socket_mode.request import SocketModeRequest
 from slack_sdk.socket_mode.response import SocketModeResponse
 from slack_sdk.socket_mode.websockets import SocketModeClient
@@ -13,8 +14,6 @@ from slackify_markdown import slackify_markdown
 
 from nanobot.bus.events import OutboundMessage
 from nanobot.bus.queue import MessageBus
-from pydantic import Field
-
 from nanobot.channels.base import BaseChannel
 from nanobot.config.schema import Base
 
@@ -24,7 +23,7 @@ class SlackDMConfig(Base):
 
     enabled: bool = True
     policy: str = "open"
-    allow_from: list[str] = Field(default_factory=list)
+    allow_from: List[str] = Field(default_factory=list)
 
 
 class SlackConfig(Base):
@@ -39,9 +38,9 @@ class SlackConfig(Base):
     reply_in_thread: bool = True
     react_emoji: str = "eyes"
     done_emoji: str = "white_check_mark"
-    allow_from: list[str] = Field(default_factory=list)
+    allow_from: List[str] = Field(default_factory=list)
     group_policy: str = "mention"
-    group_allow_from: list[str] = Field(default_factory=list)
+    group_allow_from: List[str] = Field(default_factory=list)
     dm: SlackDMConfig = Field(default_factory=SlackDMConfig)
 
 
@@ -52,17 +51,17 @@ class SlackChannel(BaseChannel):
     display_name = "Slack"
 
     @classmethod
-    def default_config(cls) -> dict[str, Any]:
+    def default_config(cls) -> Dict[str, Any]:
         return SlackConfig().model_dump(by_alias=True)
 
-    def __init__(self, config: Any, bus: MessageBus):
+    def __init__(self, config: Any, bus: MessageBus) -> None:
         if isinstance(config, dict):
             config = SlackConfig.model_validate(config)
         super().__init__(config, bus)
         self.config: SlackConfig = config
-        self._web_client: AsyncWebClient | None = None
-        self._socket_client: SocketModeClient | None = None
-        self._bot_user_id: str | None = None
+        self._web_client: Optional[AsyncWebClient] = None
+        self._socket_client: Optional[SocketModeClient] = None
+        self._bot_user_id: Optional[str] = None
 
     async def start(self) -> None:
         """Start the Slack Socket Mode client."""
@@ -92,7 +91,9 @@ class SlackChannel(BaseChannel):
             logger.warning("Slack auth_test failed: {}", e)
 
         logger.info("Starting Slack Socket Mode client...")
-        await self._socket_client.connect()
+        # This method is blocking, but we need to run it in the background
+        # so we can await the stop event.
+        asyncio.create_task(self._socket_client.connect())
 
         while self._running:
             await asyncio.sleep(1)
@@ -102,7 +103,7 @@ class SlackChannel(BaseChannel):
         self._running = False
         if self._socket_client:
             try:
-                await self._socket_client.close()
+                self._socket_client.close()
             except Exception as e:
                 logger.warning("Slack socket close failed: {}", e)
             self._socket_client = None
@@ -113,9 +114,9 @@ class SlackChannel(BaseChannel):
             logger.warning("Slack client not running")
             return
         try:
-            slack_meta = msg.metadata.get("slack", {}) if msg.metadata else {}
-            thread_ts = slack_meta.get("thread_ts")
-            channel_type = slack_meta.get("channel_type")
+            slack_meta: Dict[str, Any] = msg.metadata.get("slack", {}) if msg.metadata else {}
+            thread_ts: Optional[str] = slack_meta.get("thread_ts")
+            channel_type: Optional[str] = slack_meta.get("channel_type")
             # Slack DMs don't use threads; channel/group replies may keep thread_ts.
             thread_ts_param = thread_ts if thread_ts and channel_type != "im" else None
 
@@ -140,7 +141,7 @@ class SlackChannel(BaseChannel):
 
             # Update reaction emoji when the final (non-progress) response is sent
             if not (msg.metadata or {}).get("_progress"):
-                event = slack_meta.get("event", {})
+                event: Dict[str, Any] = slack_meta.get("event", {})
                 await self._update_react_emoji(msg.chat_id, event.get("ts"))
 
         except Exception as e:
@@ -160,16 +161,16 @@ class SlackChannel(BaseChannel):
             SocketModeResponse(envelope_id=req.envelope_id)
         )
 
-        payload = req.payload or {}
-        event = payload.get("event") or {}
-        event_type = event.get("type")
+        payload: Dict[str, Any] = req.payload or {}
+        event: Dict[str, Any] = payload.get("event") or {}
+        event_type: Optional[str] = event.get("type")
 
         # Handle app mentions or plain messages
         if event_type not in ("message", "app_mention"):
             return
 
-        sender_id = event.get("user")
-        chat_id = event.get("channel")
+        sender_id: Optional[str] = event.get("user")
+        chat_id: Optional[str] = event.get("channel")
 
         # Ignore bot/system messages (any subtype = not a normal user message)
         if event.get("subtype"):
@@ -179,7 +180,7 @@ class SlackChannel(BaseChannel):
 
         # Avoid double-processing: Slack sends both `message` and `app_mention`
         # for mentions in channels. Prefer `app_mention`.
-        text = event.get("text") or ""
+        text: str = event.get("text") or ""
         if event_type == "message" and self._bot_user_id and f"<@{self._bot_user_id}>" in text:
             return
 
@@ -196,17 +197,19 @@ class SlackChannel(BaseChannel):
         if not sender_id or not chat_id:
             return
 
-        channel_type = event.get("channel_type") or ""
+        channel_type: str = event.get("channel_type") or ""
 
         if not self._is_allowed(sender_id, chat_id, channel_type):
             return
 
-        if channel_type != "im" and not self._should_respond_in_channel(event_type, text, chat_id):
+        if channel_type != "im" and not self._should_respond_in_channel(
+            event_type, text, chat_id
+        ):
             return
 
         text = self._strip_bot_mention(text)
 
-        thread_ts = event.get("thread_ts")
+        thread_ts: Optional[str] = event.get("thread_ts")
         if self.config.reply_in_thread and not thread_ts:
             thread_ts = event.get("ts")
         # Add :eyes: reaction to the triggering message (best-effort)
@@ -221,7 +224,9 @@ class SlackChannel(BaseChannel):
             logger.debug("Slack reactions_add failed: {}", e)
 
         # Thread-scoped session key for channel/group messages
-        session_key = f"slack:{chat_id}:{thread_ts}" if thread_ts and channel_type != "im" else None
+        session_key: Optional[str] = (
+            f"slack:{chat_id}:{thread_ts}" if thread_ts and channel_type != "im" else None
+        )
 
         try:
             await self._handle_message(
@@ -240,7 +245,7 @@ class SlackChannel(BaseChannel):
         except Exception:
             logger.exception("Error handling Slack message from {}", sender_id)
 
-    async def _update_react_emoji(self, chat_id: str, ts: str | None) -> None:
+    async def _update_react_emoji(self, chat_id: str, ts: Optional[str]) -> None:
         """Remove the in-progress reaction and optionally add a done reaction."""
         if not self._web_client or not ts:
             return
@@ -309,7 +314,7 @@ class SlackChannel(BaseChannel):
     @classmethod
     def _fixup_mrkdwn(cls, text: str) -> str:
         """Fix markdown artifacts that slackify_markdown misses."""
-        code_blocks: list[str] = []
+        code_blocks: List[str] = []
 
         def _save_code(m: re.Match) -> str:
             code_blocks.append(m.group(0))
@@ -328,16 +333,20 @@ class SlackChannel(BaseChannel):
     @staticmethod
     def _convert_table(match: re.Match) -> str:
         """Convert a Markdown table to a Slack-readable list."""
-        lines = [ln.strip() for ln in match.group(0).strip().splitlines() if ln.strip()]
+        lines: List[str] = [
+            ln.strip() for ln in match.group(0).strip().splitlines() if ln.strip()
+        ]
         if len(lines) < 2:
             return match.group(0)
-        headers = [h.strip() for h in lines[0].strip("|").split("|")]
+        headers: List[str] = [h.strip() for h in lines[0].strip("|").split("|")]
         start = 2 if re.fullmatch(r"[|\s:\-]+", lines[1]) else 1
-        rows: list[str] = []
+        rows: List[str] = []
         for line in lines[start:]:
-            cells = [c.strip() for c in line.strip("|").split("|")]
+            cells: List[str] = [c.strip() for c in line.strip("|").split("|")]
             cells = (cells + [""] * len(headers))[: len(headers)]
-            parts = [f"**{headers[i]}**: {cells[i]}" for i in range(len(headers)) if cells[i]]
+            parts: List[str] = [
+                f"**{headers[i]}**: {cells[i]}" for i in range(len(headers)) if cells[i]
+            ]
             if parts:
                 rows.append(" · ".join(parts))
         return "\n".join(rows)

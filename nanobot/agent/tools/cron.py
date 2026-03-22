@@ -60,11 +60,11 @@ class CronTool(Tool):
                 },
                 "tz": {
                     "type": "string",
-                    "description": "IANA timezone for cron expressions (e.g. 'America/Vancouver')",
+                    "description": "IANA timezone for cron expressions (e.g. 'America/Vancouver')"
                 },
                 "at": {
                     "type": "string",
-                    "description": "ISO datetime for one-time execution (e.g. '2026-02-12T10:30:00')",
+                    "description": "ISO datetime for one-time execution (e.g. '2026-02-12T10:30:00')"
                 },
                 "job_id": {"type": "string", "description": "Job ID (for remove)"},
             },
@@ -106,7 +106,6 @@ class CronTool(Tool):
             return "Error: tz can only be used with cron_expr"
         if tz:
             from zoneinfo import ZoneInfo
-
             try:
                 ZoneInfo(tz)
             except (KeyError, Exception):
@@ -119,8 +118,6 @@ class CronTool(Tool):
         elif cron_expr:
             schedule = CronSchedule(kind="cron", expr=cron_expr, tz=tz)
         elif at:
-            from datetime import datetime
-
             try:
                 dt = datetime.fromisoformat(at)
             except ValueError:
@@ -158,7 +155,7 @@ class CronTool(Tool):
                 return f"every {ms // 1000}s"
             return f"every {ms}ms"
         if schedule.kind == "at" and schedule.at_ms:
-            dt = datetime.fromtimestamp(schedule.at_ms / 1000, tz=timezone.utc)
+            dt = datetime.fromtimestamp(schedule.at_ms / 1000)
             return f"at {dt.isoformat()}"
         return schedule.kind
 
@@ -167,13 +164,13 @@ class CronTool(Tool):
         """Format job run state as display lines."""
         lines: list[str] = []
         if state.last_run_at_ms:
-            last_dt = datetime.fromtimestamp(state.last_run_at_ms / 1000, tz=timezone.utc)
+            last_dt = datetime.fromtimestamp(state.last_run_at_ms / 1000)
             info = f"  Last run: {last_dt.isoformat()} — {state.last_status or 'unknown'}"
             if state.last_error:
                 info += f" ({state.last_error})"
             lines.append(info)
         if state.next_run_at_ms:
-            next_dt = datetime.fromtimestamp(state.next_run_at_ms / 1000, tz=timezone.utc)
+            next_dt = datetime.fromtimestamp(state.next_run_at_ms / 1000)
             lines.append(f"  Next run: {next_dt.isoformat()}")
         return lines
 

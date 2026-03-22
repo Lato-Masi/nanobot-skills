@@ -3,12 +3,12 @@
 import asyncio
 import json
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Dict, List, Literal, Optional
 
 import httpx
-from pydantic import Field
 import websockets
 from loguru import logger
+from pydantic import Field
 
 from nanobot.bus.events import OutboundMessage
 from nanobot.bus.queue import MessageBus
@@ -27,7 +27,7 @@ class DiscordConfig(Base):
 
     enabled: bool = False
     token: str = ""
-    allow_from: list[str] = Field(default_factory=list)
+    allow_from: List[str] = Field(default_factory=list)
     gateway_url: str = "wss://gateway.discord.gg/?v=10&encoding=json"
     intents: int = 37377
     group_policy: Literal["mention", "open"] = "mention"
@@ -40,20 +40,20 @@ class DiscordChannel(BaseChannel):
     display_name = "Discord"
 
     @classmethod
-    def default_config(cls) -> dict[str, Any]:
+    def default_config(cls) -> Dict[str, Any]:
         return DiscordConfig().model_dump(by_alias=True)
 
-    def __init__(self, config: Any, bus: MessageBus):
+    def __init__(self, config: Any, bus: MessageBus) -> None:
         if isinstance(config, dict):
             config = DiscordConfig.model_validate(config)
         super().__init__(config, bus)
         self.config: DiscordConfig = config
-        self._ws: websockets.WebSocketClientProtocol | None = None
-        self._seq: int | None = None
-        self._heartbeat_task: asyncio.Task | None = None
-        self._typing_tasks: dict[str, asyncio.Task] = {}
-        self._http: httpx.AsyncClient | None = None
-        self._bot_user_id: str | None = None
+        self._ws: Optional[websockets.WebSocketClientProtocol] = None
+        self._seq: Optional[int] = None
+        self._heartbeat_task: Optional[asyncio.Task] = None
+        self._typing_tasks: Dict[str, asyncio.Task] = {}
+        self._http: Optional[httpx.AsyncClient] = None
+        self._bot_user_id: Optional[str] = None
 
     async def start(self) -> None:
         """Start the Discord gateway connection."""
@@ -105,7 +105,7 @@ class DiscordChannel(BaseChannel):
 
         try:
             sent_media = False
-            failed_media: list[str] = []
+            failed_media: List[str] = []
 
             # Send file attachments first
             for media_path in msg.media or []:
@@ -125,7 +125,7 @@ class DiscordChannel(BaseChannel):
                 return
 
             for i, chunk in enumerate(chunks):
-                payload: dict[str, Any] = {"content": chunk}
+                payload: Dict[str, Any] = {"content": chunk}
 
                 # Let the first successful attachment carry the reply if present.
                 if i == 0 and msg.reply_to and not sent_media:
@@ -138,9 +138,12 @@ class DiscordChannel(BaseChannel):
             await self._stop_typing(msg.chat_id)
 
     async def _send_payload(
-        self, url: str, headers: dict[str, str], payload: dict[str, Any]
+        self, url: str, headers: Dict[str, str], payload: Dict[str, Any]
     ) -> bool:
         """Send a single Discord API payload with retry on rate-limit. Returns True on success."""
+        if not self._http:
+            return False
+
         for attempt in range(3):
             try:
                 response = await self._http.post(url, headers=headers, json=payload)
@@ -162,11 +165,14 @@ class DiscordChannel(BaseChannel):
     async def _send_file(
         self,
         url: str,
-        headers: dict[str, str],
+        headers: Dict[str, str],
         file_path: str,
-        reply_to: str | None = None,
+        reply_to: Optional[str] = None,
     ) -> bool:
         """Send a file attachment via Discord REST API using multipart/form-data."""
+        if not self._http:
+            return False
+
         path = Path(file_path)
         if not path.is_file():
             logger.warning("Discord file not found, skipping: {}", file_path)
@@ -176,7 +182,7 @@ class DiscordChannel(BaseChannel):
             logger.warning("Discord file too large (>20MB), skipping: {}", path.name)
             return False
 
-        payload_json: dict[str, Any] = {}
+        payload_json: Dict[str, Any] = {}
         if reply_to:
             payload_json["message_reference"] = {"message_id": reply_to}
             payload_json["allowed_mentions"] = {"replied_user": False}
@@ -185,7 +191,7 @@ class DiscordChannel(BaseChannel):
             try:
                 with open(path, "rb") as f:
                     files = {"files[0]": (path.name, f, "application/octet-stream")}
-                    data: dict[str, Any] = {}
+                    data: Dict[str, Any] = {}
                     if payload_json:
                         data["payload_json"] = json.dumps(payload_json)
                     response = await self._http.post(
@@ -214,7 +220,7 @@ class DiscordChannel(BaseChannel):
 
         async for raw in self._ws:
             try:
-                data = json.loads(raw)
+                data: Dict[str, Any] = json.loads(raw)
             except json.JSONDecodeError:
                 logger.warning("Invalid JSON from Discord gateway: {}", raw[:100])
                 continue
@@ -235,7 +241,7 @@ class DiscordChannel(BaseChannel):
             elif op == 0 and event_type == "READY":
                 logger.info("Discord gateway READY")
                 # Capture bot user ID for mention detection
-                user_data = payload.get("user") or {}
+                user_data: Dict[str, Any] = payload.get("user") or {}
                 self._bot_user_id = user_data.get("id")
                 logger.info("Discord bot connected as user {}", self._bot_user_id)
             elif op == 0 and event_type == "MESSAGE_CREATE":
@@ -285,16 +291,16 @@ class DiscordChannel(BaseChannel):
 
         self._heartbeat_task = asyncio.create_task(heartbeat_loop())
 
-    async def _handle_message_create(self, payload: dict[str, Any]) -> None:
+    async def _handle_message_create(self, payload: Dict[str, Any]) -> None:
         """Handle incoming Discord messages."""
-        author = payload.get("author") or {}
+        author: Dict[str, Any] = payload.get("author") or {}
         if author.get("bot"):
             return
 
         sender_id = str(author.get("id", ""))
         channel_id = str(payload.get("channel_id", ""))
-        content = payload.get("content") or ""
-        guild_id = payload.get("guild_id")
+        content: str = payload.get("content") or ""
+        guild_id: Optional[str] = payload.get("guild_id")
 
         if not sender_id or not channel_id:
             return
@@ -307,8 +313,8 @@ class DiscordChannel(BaseChannel):
             if not self._should_respond_in_group(payload, content):
                 return
 
-        content_parts = [content] if content else []
-        media_paths: list[str] = []
+        content_parts: List[str] = [content] if content else []
+        media_paths: List[str] = []
         media_dir = get_media_dir("discord")
 
         for attachment in payload.get("attachments") or []:
@@ -317,7 +323,7 @@ class DiscordChannel(BaseChannel):
             size = attachment.get("size") or 0
             if not url or not self._http:
                 continue
-            if size and size > MAX_ATTACHMENT_BYTES:
+            if size > MAX_ATTACHMENT_BYTES:
                 content_parts.append(f"[attachment: {filename} - too large]")
                 continue
             try:
@@ -332,7 +338,7 @@ class DiscordChannel(BaseChannel):
                 logger.warning("Failed to download Discord attachment: {}", e)
                 content_parts.append(f"[attachment: {filename} - download failed]")
 
-        reply_to = (payload.get("referenced_message") or {}).get("id")
+        reply_to: Optional[str] = (payload.get("referenced_message") or {}).get("id")
 
         await self._start_typing(channel_id)
 
@@ -348,7 +354,7 @@ class DiscordChannel(BaseChannel):
             },
         )
 
-    def _should_respond_in_group(self, payload: dict[str, Any], content: str) -> bool:
+    def _should_respond_in_group(self, payload: Dict[str, Any], content: str) -> bool:
         """Check if bot should respond in a group channel based on policy."""
         if self.config.group_policy == "open":
             return True
@@ -357,26 +363,35 @@ class DiscordChannel(BaseChannel):
             # Check if bot was mentioned in the message
             if self._bot_user_id:
                 # Check mentions array
-                mentions = payload.get("mentions") or []
+                mentions: List[Dict[str, Any]] = payload.get("mentions") or []
                 for mention in mentions:
                     if str(mention.get("id")) == self._bot_user_id:
                         return True
                 # Also check content for mention format <@USER_ID>
-                if f"<@{self._bot_user_id}>" in content or f"<@!{self._bot_user_id}>" in content:
+                if (
+                    f"<@{self._bot_user_id}>" in content
+                    or f"<@!{self._bot_user_id}>" in content
+                ):
                     return True
-            logger.debug("Discord message in {} ignored (bot not mentioned)", payload.get("channel_id"))
+            logger.debug(
+                "Discord message in {} ignored (bot not mentioned)",
+                payload.get("channel_id"),
+            )
             return False
 
         return True
 
     async def _start_typing(self, channel_id: str) -> None:
         """Start periodic typing indicator for a channel."""
+        if not self._http:
+            return
+
         await self._stop_typing(channel_id)
 
         async def typing_loop() -> None:
             url = f"{DISCORD_API_BASE}/channels/{channel_id}/typing"
             headers = {"Authorization": f"Bot {self.config.token}"}
-            while self._running:
+            while self._running and self._http:
                 try:
                     await self._http.post(url, headers=headers)
                 except asyncio.CancelledError:

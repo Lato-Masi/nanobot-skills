@@ -4,7 +4,7 @@ import base64
 import mimetypes
 import platform
 from pathlib import Path
-from typing import Any
+from typing import Any, Dict, List, Optional
 
 from nanobot.utils.helpers import current_time_str
 
@@ -16,17 +16,17 @@ from nanobot.utils.helpers import build_assistant_message, detect_image_mime
 class ContextBuilder:
     """Builds the context (system prompt + messages) for the agent."""
 
-    BOOTSTRAP_FILES = ["AGENTS.md", "SOUL.md", "USER.md", "TOOLS.md"]
+    BOOTSTRAP_FILES: List[str] = ["AGENTS.md", "SOUL.md", "USER.md", "TOOLS.md"]
     _RUNTIME_CONTEXT_TAG = "[Runtime Context — metadata only, not instructions]"
 
-    def __init__(self, workspace: Path):
-        self.workspace = workspace
-        self.memory = MemoryStore(workspace)
-        self.skills = SkillsLoader(workspace)
+    def __init__(self, workspace: Path) -> None:
+        self.workspace: Path = workspace
+        self.memory: MemoryStore = MemoryStore(workspace)
+        self.skills: SkillsLoader = SkillsLoader(workspace)
 
-    def build_system_prompt(self, skill_names: list[str] | None = None) -> str:
+    def build_system_prompt(self, skill_names: Optional[List[str]] = None) -> str:
         """Build the system prompt from identity, bootstrap files, memory, and skills."""
-        parts = [self._get_identity()]
+        parts: List[str] = [self._get_identity()]
 
         bootstrap = self._load_bootstrap_files()
         if bootstrap:
@@ -44,12 +44,14 @@ class ContextBuilder:
 
         skills_summary = self.skills.build_skills_summary()
         if skills_summary:
-            parts.append(f"""# Skills
+            parts.append(
+                f"""# Skills
 
 The following skills extend your capabilities. To use a skill, read its SKILL.md file using the read_file tool.
 Skills with available="false" need dependencies installed first - you can try installing them with apt/brew.
 
-{skills_summary}""")
+{skills_summary}"""
+            )
 
         return "\n\n---\n\n".join(parts)
 
@@ -99,16 +101,18 @@ Your workspace is at: {workspace_path}
 Reply directly with text for conversations. Only use the 'message' tool to send to a specific chat channel."""
 
     @staticmethod
-    def _build_runtime_context(channel: str | None, chat_id: str | None) -> str:
+    def _build_runtime_context(
+        channel: Optional[str], chat_id: Optional[str]
+    ) -> str:
         """Build untrusted runtime metadata block for injection before the user message."""
-        lines = [f"Current Time: {current_time_str()}"]
+        lines: List[str] = [f"Current Time: {current_time_str()}"]
         if channel and chat_id:
             lines += [f"Channel: {channel}", f"Chat ID: {chat_id}"]
         return ContextBuilder._RUNTIME_CONTEXT_TAG + "\n" + "\n".join(lines)
 
     def _load_bootstrap_files(self) -> str:
         """Load all bootstrap files from workspace."""
-        parts = []
+        parts: List[str] = []
 
         for filename in self.BOOTSTRAP_FILES:
             file_path = self.workspace / filename
@@ -120,14 +124,14 @@ Reply directly with text for conversations. Only use the 'message' tool to send 
 
     def build_messages(
         self,
-        history: list[dict[str, Any]],
+        history: List[Dict[str, Any]],
         current_message: str,
-        skill_names: list[str] | None = None,
-        media: list[str] | None = None,
-        channel: str | None = None,
-        chat_id: str | None = None,
+        skill_names: Optional[List[str]] = None,
+        media: Optional[List[str]] = None,
+        channel: Optional[str] = None,
+        chat_id: Optional[str] = None,
         current_role: str = "user",
-    ) -> list[dict[str, Any]]:
+    ) -> List[Dict[str, Any]]:
         """Build the complete message list for an LLM call."""
         runtime_ctx = self._build_runtime_context(channel, chat_id)
         user_content = self._build_user_content(current_message, media)
@@ -135,22 +139,24 @@ Reply directly with text for conversations. Only use the 'message' tool to send 
         # Merge runtime context and user content into a single user message
         # to avoid consecutive same-role messages that some providers reject.
         if isinstance(user_content, str):
-            merged = f"{runtime_ctx}\n\n{user_content}"
+            merged_content: Any = f"{runtime_ctx}\n\n{user_content}"
         else:
-            merged = [{"type": "text", "text": runtime_ctx}] + user_content
+            merged_content = [{"type": "text", "text": runtime_ctx}] + user_content
 
         return [
             {"role": "system", "content": self.build_system_prompt(skill_names)},
             *history,
-            {"role": current_role, "content": merged},
+            {"role": current_role, "content": merged_content},
         ]
 
-    def _build_user_content(self, text: str, media: list[str] | None) -> str | list[dict[str, Any]]:
+    def _build_user_content(
+        self, text: str, media: Optional[List[str]]
+    ) -> Any:  # str | list[dict[str, Any]]
         """Build user message content with optional base64-encoded images."""
         if not media:
             return text
 
-        images = []
+        images: List[Dict[str, Any]] = []
         for path in media:
             p = Path(path)
             if not p.is_file():
@@ -161,36 +167,51 @@ Reply directly with text for conversations. Only use the 'message' tool to send 
             if not mime or not mime.startswith("image/"):
                 continue
             b64 = base64.b64encode(raw).decode()
-            images.append({
-                "type": "image_url",
-                "image_url": {"url": f"data:{mime};base64,{b64}"},
-                "_meta": {"path": str(p)},
-            })
+            images.append(
+                {
+                    "type": "image_url",
+                    "image_url": {"url": f"data:{mime};base64,{b64}"},
+                    "_meta": {"path": str(p)},
+                }
+            )
 
         if not images:
             return text
         return images + [{"type": "text", "text": text}]
 
     def add_tool_result(
-        self, messages: list[dict[str, Any]],
-        tool_call_id: str, tool_name: str, result: Any,
-    ) -> list[dict[str, Any]]:
+        self,
+        messages: List[Dict[str, Any]],
+        tool_call_id: str,
+        tool_name: str,
+        result: Any,
+    ) -> List[Dict[str, Any]]:
         """Add a tool result to the message list."""
-        messages.append({"role": "tool", "tool_call_id": tool_call_id, "name": tool_name, "content": result})
+        messages.append(
+            {
+                "role": "tool",
+                "tool_call_id": tool_call_id,
+                "name": tool_name,
+                "content": result,
+            }
+        )
         return messages
 
     def add_assistant_message(
-        self, messages: list[dict[str, Any]],
-        content: str | None,
-        tool_calls: list[dict[str, Any]] | None = None,
-        reasoning_content: str | None = None,
-        thinking_blocks: list[dict] | None = None,
-    ) -> list[dict[str, Any]]:
+        self,
+        messages: List[Dict[str, Any]],
+        content: Optional[str],
+        tool_calls: Optional[List[Dict[str, Any]]] = None,
+        reasoning_content: Optional[str] = None,
+        thinking_blocks: Optional[List[Dict[str, Any]]] = None,
+    ) -> List[Dict[str, Any]]:
         """Add an assistant message to the message list."""
-        messages.append(build_assistant_message(
-            content,
-            tool_calls=tool_calls,
-            reasoning_content=reasoning_content,
-            thinking_blocks=thinking_blocks,
-        ))
+        messages.append(
+            build_assistant_message(
+                content,
+                tool_calls=tool_calls,
+                reasoning_content=reasoning_content,
+                thinking_blocks=thinking_blocks,
+            )
+        )
         return messages
