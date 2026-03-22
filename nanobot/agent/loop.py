@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 import os
 import sys
 import time
@@ -100,7 +101,7 @@ class AgentLoop:
             web_search_config=self.web_search_config,
             web_proxy=web_proxy,
             exec_config=self.exec_config,
-            restrict_to_workspace=restrict_to_workspace,
+            restrict_to_workspace=self.restrict_to_workspace,
         )
 
         self._running: bool = False
@@ -167,7 +168,7 @@ class AgentLoop:
             logger.error("Failed to connect MCP servers (will retry next message): {}", e)
             if self._mcp_stack:
                 try:
-                    await self._mcp_stack.aclose()
+                    await self._mcp_stack.__aexit__(None, None, None)
                 except Exception:
                     pass
                 self._mcp_stack = None
@@ -428,8 +429,8 @@ class AgentLoop:
             self._background_tasks.clear()
         if self._mcp_stack:
             try:
-                await self._mcp_stack.aclose()
-            except (RuntimeError, BaseExceptionGroup):
+                await self._mcp_stack.__aexit__(None, None, None)
+            except Exception:
                 pass  # MCP SDK cancel scope cleanup is noisy but harmless
             self._mcp_stack = None
 
