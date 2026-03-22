@@ -1,5 +1,6 @@
 """Base class for agent tools."""
 
+from __future__ import annotations
 from abc import ABC, abstractmethod
 from typing import Any
 
@@ -64,6 +65,10 @@ class Tool(ABC):
         Returns:
             Result of the tool execution (string or list of content blocks).
         """
+        pass
+
+    def set_context(self, **kwargs: Any) -> None:
+        """Set message context for tools that need it (optional)."""
         pass
 
     def cast_params(self, params: dict[str, Any]) -> dict[str, Any]:
@@ -165,28 +170,32 @@ class Tool(ABC):
         if "enum" in schema and val not in schema["enum"]:
             errors.append(f"{label} must be one of {schema['enum']}")
         if t in ("integer", "number"):
-            if "minimum" in schema and val < schema["minimum"]:
-                errors.append(f"{label} must be >= {schema['minimum']}")
-            if "maximum" in schema and val > schema["maximum"]:
-                errors.append(f"{label} must be <= {schema['maximum']}")
+            if isinstance(val, (int, float)) and not isinstance(val, bool):
+                if "minimum" in schema and val < schema["minimum"]:
+                    errors.append(f"{label} must be >= {schema['minimum']}")
+                if "maximum" in schema and val > schema["maximum"]:
+                    errors.append(f"{label} must be <= {schema['maximum']}")
         if t == "string":
-            if "minLength" in schema and len(val) < schema["minLength"]:
-                errors.append(f"{label} must be at least {schema['minLength']} chars")
-            if "maxLength" in schema and len(val) > schema["maxLength"]:
-                errors.append(f"{label} must be at most {schema['maxLength']} chars")
+            if isinstance(val, str):
+                if "minLength" in schema and len(val) < schema["minLength"]:
+                    errors.append(f"{label} must be at least {schema['minLength']} chars")
+                if "maxLength" in schema and len(val) > schema["maxLength"]:
+                    errors.append(f"{label} must be at most {schema['maxLength']} chars")
         if t == "object":
-            props = schema.get("properties", {})
-            for k in schema.get("required", []):
-                if k not in val:
-                    errors.append(f"missing required {path + '.' + k if path else k}")
-            for k, v in val.items():
-                if k in props:
-                    errors.extend(self._validate(v, props[k], path + "." + k if path else k))
+            if isinstance(val, dict):
+                props = schema.get("properties", {})
+                for k in schema.get("required", []):
+                    if k not in val:
+                        errors.append(f"missing required {path + '.' + k if path else k}")
+                for k, v in val.items():
+                    if k in props:
+                        errors.extend(self._validate(v, props[k], path + "." + k if path else k))
         if t == "array" and "items" in schema:
-            for i, item in enumerate(val):
-                errors.extend(
-                    self._validate(item, schema["items"], f"{path}[{i}]" if path else f"[{i}]")
-                )
+            if isinstance(val, list):
+                for i, item in enumerate(val):
+                    errors.extend(
+                        self._validate(item, schema["items"], f"{path}[{i}]" if path else f"[{i}]")
+                    )
         return errors
 
     def to_schema(self) -> dict[str, Any]:

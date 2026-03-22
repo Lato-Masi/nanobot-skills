@@ -93,7 +93,14 @@ class ReadFileTool(_FsTool):
             "required": ["path"],
         }
 
-    async def execute(self, path: str, offset: int = 1, limit: int | None = None, **kwargs: Any) -> Any:
+    async def execute(self, **kwargs: Any) -> Any:
+        path = kwargs.get("path")
+        offset = kwargs.get("offset", 1)
+        limit = kwargs.get("limit")
+
+        if not path:
+            return "Error: path is a required parameter."
+
         try:
             fp = self._resolve(path)
             if not fp.exists():
@@ -174,7 +181,13 @@ class WriteFileTool(_FsTool):
             "required": ["path", "content"],
         }
 
-    async def execute(self, path: str, content: str, **kwargs: Any) -> str:
+    async def execute(self, **kwargs: Any) -> str:
+        path = kwargs.get("path")
+        content = kwargs.get("content")
+
+        if not path or content is None:
+            return "Error: path and content are required parameters."
+
         try:
             fp = self._resolve(path)
             fp.parent.mkdir(parents=True, exist_ok=True)
@@ -247,10 +260,15 @@ class EditFileTool(_FsTool):
             "required": ["path", "old_text", "new_text"],
         }
 
-    async def execute(
-        self, path: str, old_text: str, new_text: str,
-        replace_all: bool = False, **kwargs: Any,
-    ) -> str:
+    async def execute(self, **kwargs: Any) -> str:
+        path = kwargs.get("path")
+        old_text = kwargs.get("old_text")
+        new_text = kwargs.get("new_text")
+        replace_all = kwargs.get("replace_all", False)
+
+        if not path or old_text is None or new_text is None:
+            return "Error: path, old_text, and new_text are required parameters."
+
         try:
             fp = self._resolve(path)
             if not fp.exists():
@@ -349,10 +367,14 @@ class ListDirTool(_FsTool):
             "required": ["path"],
         }
 
-    async def execute(
-        self, path: str, recursive: bool = False,
-        max_entries: int | None = None, **kwargs: Any,
-    ) -> str:
+    async def execute(self, **kwargs: Any) -> str:
+        path = kwargs.get("path")
+        recursive = kwargs.get("recursive", False)
+        max_entries = kwargs.get("max_entries")
+
+        if not path:
+            return "Error: path is a required parameter."
+
         try:
             dp = self._resolve(path)
             if not dp.exists():

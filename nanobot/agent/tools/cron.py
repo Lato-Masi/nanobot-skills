@@ -18,10 +18,10 @@ class CronTool(Tool):
         self._chat_id = ""
         self._in_cron_context: ContextVar[bool] = ContextVar("cron_in_context", default=False)
 
-    def set_context(self, channel: str, chat_id: str) -> None:
+    def set_context(self, **kwargs: Any) -> None:
         """Set the current session context for delivery."""
-        self._channel = channel
-        self._chat_id = chat_id
+        self._channel = kwargs.get("channel", "")
+        self._chat_id = kwargs.get("chat_id", "")
 
     def set_cron_context(self, active: bool):
         """Mark whether the tool is executing inside a cron job callback."""
@@ -71,17 +71,15 @@ class CronTool(Tool):
             "required": ["action"],
         }
 
-    async def execute(
-        self,
-        action: str,
-        message: str = "",
-        every_seconds: int | None = None,
-        cron_expr: str | None = None,
-        tz: str | None = None,
-        at: str | None = None,
-        job_id: str | None = None,
-        **kwargs: Any,
-    ) -> str:
+    async def execute(self, **kwargs: Any) -> str:
+        action = kwargs.get("action")
+        message = kwargs.get("message", "")
+        every_seconds = kwargs.get("every_seconds")
+        cron_expr = kwargs.get("cron_expr")
+        tz = kwargs.get("tz")
+        at = kwargs.get("at")
+        job_id = kwargs.get("job_id")
+
         if action == "add":
             if self._in_cron_context.get():
                 return "Error: cannot schedule new jobs from within a cron job execution"

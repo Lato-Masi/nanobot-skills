@@ -17,7 +17,7 @@ class SpawnTool(Tool):
         self._origin_chat_id = "direct"
         self._session_key = "cli:direct"
 
-    def set_context(self, channel: str, chat_id: str) -> None:
+    def set_context(self, channel: str, chat_id: str, **kwargs: Any) -> None:
         """Set the origin context for subagent announcements."""
         self._origin_channel = channel
         self._origin_chat_id = chat_id
@@ -54,8 +54,10 @@ class SpawnTool(Tool):
             "required": ["task"],
         }
 
-    async def execute(self, task: str, label: str | None = None, **kwargs: Any) -> str:
+    async def execute(self, **kwargs: Any) -> str:
         """Spawn a subagent to execute the given task."""
+        task = kwargs.get("task")
+        label = kwargs.get("label")
         return await self._manager.spawn(
             task=task,
             label=label,

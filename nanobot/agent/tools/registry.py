@@ -45,13 +45,13 @@ class ToolRegistry:
 
         try:
             # Attempt to cast parameters to match schema types
-            params = tool.cast_params(params)
-            
+            casted_params = tool.cast_params(params)
+
             # Validate parameters
-            errors = tool.validate_params(params)
+            errors = tool.validate_params(casted_params)
             if errors:
                 return f"Error: Invalid parameters for tool '{name}': " + "; ".join(errors) + _HINT
-            result = await tool.execute(**params)
+            result = await tool.execute(**casted_params)
             if isinstance(result, str) and result.startswith("Error"):
                 return result + _HINT
             return result

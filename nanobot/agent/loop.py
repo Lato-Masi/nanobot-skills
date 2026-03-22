@@ -298,9 +298,10 @@ class AgentLoop:
             except asyncio.TimeoutError:
                 continue
             except asyncio.CancelledError:
+                task = asyncio.current_task()
                 # Preserve real task cancellation so shutdown can complete cleanly.
                 # Only ignore non-task CancelledError signals that may leak from integrations.
-                if not self._running or asyncio.current_task().cancelling():
+                if not self._running or (task and task.cancelling()):
                     raise
                 continue
             except Exception as e:
