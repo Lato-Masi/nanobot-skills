@@ -1,10 +1,11 @@
 """Interactive onboarding questionnaire for nanobot."""
 
+from __future__ import annotations
 import json
 import types
 from dataclasses import dataclass
 from functools import lru_cache
-from typing import Any, NamedTuple, get_args, get_origin
+from typing import Any, NamedTuple, get_args, get_origin, Generator, Callable
 
 try:
     import questionary
@@ -50,7 +51,7 @@ _SELECT_FIELD_HINTS: dict[str, tuple[list[str], str]] = {
 _BACK_PRESSED = object()  # Sentinel value for back navigation
 
 
-def _get_questionary():
+def _get_questionary() -> Any:
     """Return questionary or raise a clear error when wizard deps are unavailable."""
     if questionary is None:
         raise RuntimeError(
@@ -97,7 +98,7 @@ def _select_with_back(
     state: dict[str, str | None | object] = {"result": None}
 
     # Build menu items (uses closure over selected_index)
-    def get_menu_text():
+    def get_menu_text() -> list[tuple[str, str]]:
         items = []
         for i, choice in enumerate(choices):
             if i == selected_index:
@@ -119,34 +120,34 @@ def _select_with_back(
     bindings = KeyBindings()
 
     @bindings.add(Keys.Up)
-    def _up(event):
+    def _up(event: Any) -> None:
         nonlocal selected_index
         selected_index = (selected_index - 1) % len(choices)
         event.app.invalidate()
 
     @bindings.add(Keys.Down)
-    def _down(event):
+    def _down(event: Any) -> None:
         nonlocal selected_index
         selected_index = (selected_index + 1) % len(choices)
         event.app.invalidate()
 
     @bindings.add(Keys.Enter)
-    def _enter(event):
+    def _enter(event: Any) -> None:
         state["result"] = choices[selected_index]
         event.app.exit()
 
     @bindings.add("escape")
-    def _escape(event):
+    def _escape(event: Any) -> None:
         state["result"] = _BACK_PRESSED
         event.app.exit()
 
     @bindings.add(Keys.Left)
-    def _left(event):
+    def _left(event: Any) -> None:
         state["result"] = _BACK_PRESSED
         event.app.exit()
 
     @bindings.add(Keys.ControlC)
-    def _ctrl_c(event):
+    def _ctrl_c(event: Any) -> None:
         state["result"] = None
         event.app.exit()
 
@@ -175,7 +176,7 @@ class FieldTypeInfo(NamedTuple):
     inner_type: Any
 
 
-def _get_field_type_info(field_info) -> FieldTypeInfo:
+def _get_field_type_info(field_info: Any) -> FieldTypeInfo:
     """Extract field type info from Pydantic field."""
     annotation = field_info.annotation
     if annotation is None:
@@ -205,7 +206,7 @@ def _get_field_type_info(field_info) -> FieldTypeInfo:
     return FieldTypeInfo("str", None)
 
 
-def _get_field_display_name(field_key: str, field_info) -> str:
+def _get_field_display_name(field_key: str, field_info: Any) -> str:
     """Get display name for a field."""
     if field_info and field_info.description:
         return field_info.description
@@ -254,7 +255,7 @@ def _format_value(value: Any, rich: bool = True, field_name: str = "") -> str:
         masked = _mask_value(value)
         return f"[dim]{masked}[/dim]" if rich else masked
     if isinstance(value, BaseModel):
-        parts = []
+        parts: list[str] = []
         for fname, _finfo in type(value).model_fields.items():
             fval = getattr(value, fname, None)
             formatted = _format_value(fval, rich=False, field_name=fname)
@@ -282,7 +283,7 @@ def _format_value_for_input(value: Any, field_type: str) -> str:
 # --- Rich UI Components ---
 
 
-def _show_config_panel(display_name: str, model: BaseModel, fields: list) -> None:
+def _show_config_panel(display_name: str, model: BaseModel, fields: list[tuple[str, Any]]) -> None:
     """Display current configuration as a rich table."""
     table = Table(show_header=False, box=None, padding=(0, 2))
     table.add_column("Field", style="cyan")
@@ -400,7 +401,8 @@ def _input_model_with_autocomplete(
     """Get model input with autocomplete suggestions.
 
     """
-    from prompt_toolkit.completion import Completer, Completion
+    from prompt_toolkit.completion import Completer, Completion, CompleteEvent
+    from prompt_toolkit.document import Document
 
     default = str(current) if current else ""
 
@@ -410,7 +412,7 @@ def _input_model_with_autocomplete(
         def __init__(self, provider_name: str):
             self.provider = provider_name
 
-        def get_completions(self, document, complete_event):
+        def get_completions(self, document: Document, complete_event: CompleteEvent) -> Generator[Completion, None, None]:
             text = document.text_before_cursor
             suggestions = get_model_suggestions(text, provider=self.provider, limit=50)
             for model in suggestions:
@@ -512,7 +514,7 @@ def _handle_context_window_field(
         setattr(working_model, field_name, new_value)
 
 
-_FIELD_HANDLERS: dict[str, Any] = {
+_FIELD_HANDLERS: dict[str, Callable[[BaseModel, str, str, Any], None]] = {
     "model": _handle_model_field,
     "context_window_tokens": _handle_context_window_field,
 }
@@ -532,7 +534,7 @@ def _configure_pydantic_model(
     skip_fields = skip_fields or set()
     working_model = model.model_copy(deep=True)
 
-    fields = [
+    fields: list[tuple[str, Any]] = [
         (name, info)
         for name, info in type(working_model).model_fields.items()
         if name not in skip_fields
@@ -542,7 +544,7 @@ def _configure_pydantic_model(
         return working_model
 
     def get_choices() -> list[str]:
-        items = []
+        items: list[str] = []
         for fname, finfo in fields:
             value = getattr(working_model, fname, None)
             display = _get_field_display_name(fname, finfo)
@@ -825,13 +827,13 @@ _SETTINGS_SECTIONS: dict[str, tuple[str, str, set[str] | None]] = {
     "Tools": ("Tools Settings", "Configure web search, shell exec, and other tools", {"mcp_servers"}),
 }
 
-_SETTINGS_GETTER = {
+_SETTINGS_GETTER: dict[str, Callable[[Config], BaseModel]] = {
     "Agent Settings": lambda c: c.agents.defaults,
     "Gateway": lambda c: c.gateway,
     "Tools": lambda c: c.tools,
 }
 
-_SETTINGS_SETTER = {
+_SETTINGS_SETTER: dict[str, Callable[[Config, BaseModel], None]] = {
     "Agent Settings": lambda c, v: setattr(c.agents, "defaults", v),
     "Gateway": lambda c, v: setattr(c, "gateway", v),
     "Tools": lambda c, v: setattr(c, "tools", v),
@@ -1004,7 +1006,7 @@ def run_onboard(initial_config: Config | None = None) -> OnboardResult:
                 return OnboardResult(config=original_config, should_save=False)
             continue
 
-        _MENU_DISPATCH = {
+        _MENU_DISPATCH: dict[str, Callable[[], None]] = {
             "[P] LLM Provider": lambda: _configure_providers(config),
             "[C] Chat Channel": lambda: _configure_channels(config),
             "[A] Agent Settings": lambda: _configure_general_settings(config, "Agent Settings"),

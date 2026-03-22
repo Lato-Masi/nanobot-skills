@@ -1,7 +1,10 @@
 """Configuration loading utilities."""
 
+from __future__ import annotations
+
 import json
 from pathlib import Path
+from typing import Any
 
 import pydantic
 from loguru import logger
@@ -67,7 +70,7 @@ def save_config(config: Config, config_path: Path | None = None) -> None:
         json.dump(data, f, indent=2, ensure_ascii=False)
 
 
-def _migrate_config(data: dict) -> dict:
+def _migrate_config(data: dict[str, Any]) -> dict[str, Any]:
     """Migrate old config formats to current."""
     # Move tools.exec.restrictToWorkspace → tools.restrictToWorkspace
     tools = data.get("tools", {})
