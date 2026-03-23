@@ -73,8 +73,6 @@ from nanobot.utils.helpers import build_status_content
 if TYPE_CHECKING:
     from nanobot.config.schema import (
         ChannelsConfig,
-        ExecToolConfig,
-        WebSearchConfig,
     )
     from nanobot.cron.service import CronService
 
@@ -226,12 +224,11 @@ class AgentLoop:
         if self._mcp_connected or self._mcp_connecting or not self._mcp_servers:
             return
         self._mcp_connecting = True
-
         try:
-            async with AsyncExitStack() as stack:
-                self._mcp_stack = stack
-                await connect_mcp_servers(self._mcp_servers, self.tools, self._mcp_stack)
-                self._mcp_connected = True
+            self._mcp_stack = AsyncExitStack()
+            await self._mcp_stack.__aenter__()  # pylint: disable=unnecessary-dunder-call
+            await connect_mcp_servers(self._mcp_servers, self.tools, self._mcp_stack)
+            self._mcp_connected = True
         except BaseException as e:
             logger.error(f"Failed to connect MCP servers (will retry on next message): {e}")
             if self._mcp_stack:

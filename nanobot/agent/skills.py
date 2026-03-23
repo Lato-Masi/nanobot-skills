@@ -233,7 +233,7 @@ class SkillsLoader:
         Returns:
             Metadata dict or None.
         """
-        content = self.load_skill(.name)
+        content = self.load_skill(name)
         if not content:
             return None
 
