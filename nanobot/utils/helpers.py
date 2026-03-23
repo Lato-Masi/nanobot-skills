@@ -256,3 +256,15 @@ def sync_workspace_templates(workspace: Path, silent: bool = False) -> list[str]
         for name in added:
             Console().print(f"  [dim]Created {name}[/dim]")
     return added
+
+def build_help_content() -> str:
+    """Builds the help message content."""
+    lines = [
+        "🐈 nanobot commands:",
+        "/new — Start a new conversation",
+        "/stop — Stop the current task",
+        "/restart — Restart the bot",
+        "/status — Show bot status",
+        "/help — Show available commands",
+    ]
+    return "\n".join(lines)

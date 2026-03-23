@@ -1,0 +1,2 @@
+[MESSAGES CONTROL]
+disable=protected-access,import-outside-toplevel,unnecessary-dunder-call,trailing-newlines
