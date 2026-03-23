@@ -36,7 +36,7 @@ from nanobot import __logo__, __version__
 from nanobot.config.paths import get_workspace_path
 from nanobot.config.schema import Config
 from nanobot.utils.helpers import sync_workspace_templates
-from nanobot.providers.base import BaseProvider
+from nanobot.providers.base import LLMProvider
 
 app = typer.Typer(
     name="nanobot",
@@ -407,7 +407,7 @@ def _onboard_plugins(config_path: Path) -> None:
         json.dump(data, f, indent=2, ensure_ascii=False)
 
 
-def _make_provider(config: Config) -> BaseProvider:
+def _make_provider(config: Config) -> LLMProvider:
     """Create the appropriate LLM provider from config."""
     from nanobot.providers.azure_openai_provider import AzureOpenAIProvider
     from nanobot.providers.base import GenerationSettings

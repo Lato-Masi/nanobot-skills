@@ -245,7 +245,7 @@ class SkillsLoader:
                 for line in match.group(1).split("\n"):
                     if ":" in line:
                         key, value = line.split(":", 1)
-                        metadata[key.strip()] = value.strip().strip('\"\'')
+                        metadata[key.strip()] = value.strip().strip('"').strip("'")
                 return metadata
 
         return None

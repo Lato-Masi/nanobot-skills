@@ -38,27 +38,25 @@ class CommandHandler:
         self._schedule_background = schedule_background
         self._get_status_params = get_status_params
 
-    async def handle(self, msg: InboundMessage) -> bool:
-        """Handles a slash command, if present.
+    async def handle_queued(self, msg: InboundMessage) -> bool:
+        """Handles a slash command that should be run within the processing lock.
 
         Returns:
             True if a command was handled, False otherwise.
         """
         cmd = msg.content.strip().lower()
-        if not cmd.startswith("/"):
+        if not cmd.startswith("/") or cmd in ("/stop", "/restart"):
             return False
 
-        if cmd == "/stop":
-            await self.handle_stop(msg)
-        elif cmd == "/restart":
-            await self.handle_restart(msg)
-        elif cmd == "/new":
+        if cmd == "/new":
             session = self.sessions.get_or_create(msg.session_key)
             await self.handle_new(msg, session)
-        elif cmd == "/status":
+            return True
+        if cmd == "/status":
             session = self.sessions.get_or_create(msg.session_key)
             await self.bus.publish_outbound(await self._status_response(msg, session))
-        elif cmd == "/help":
+            return True
+        if cmd == "/help":
             await self.bus.publish_outbound(
                 OutboundMessage(
                     channel=msg.channel,
@@ -67,9 +65,9 @@ class CommandHandler:
                     metadata={"render_as": "text"},
                 )
             )
-        else:
-            return False
-        return True
+            return True
+
+        return False  # Unhandled command
 
     async def handle_stop(self, msg: InboundMessage) -> None:
         """Handles the /stop command by canceling active tasks for the session."""
@@ -102,7 +100,7 @@ class CommandHandler:
 
         asyncio.create_task(_do_restart())
 
-    async def handle_new(self, msg: InboundMessage, session: Session) -> None:
+    async def handle_new(self, msg: InboundMessage, session: "Session") -> None:
         """Handles the /new command by clearing the session."""
         snapshot = session.messages[session.last_consolidated :]
         session.clear()
@@ -120,11 +118,13 @@ class CommandHandler:
             )
         )
 
-    async def _status_response(self, msg: InboundMessage, session: Session) -> OutboundMessage:
+    async def _status_response(self, msg: InboundMessage, session: "Session") -> OutboundMessage:
         """Builds an outbound status message for a given session."""
         ctx_est = 0
         try:
-            ctx_est, _ = await self.memory_consolidator.estimate_session_prompt_tokens(session)
+            ctx_est, _ = await self.memory_consolidator.estimate_session_prompt_tokens(
+                session
+            )
         except Exception:
             pass
 

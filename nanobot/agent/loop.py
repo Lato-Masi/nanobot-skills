@@ -1,4 +1,4 @@
-# pylint: disable=protected-access, import-outside-toplevel, unnecessary-dunder-call, trailing-newlines
+# pylint: disable=protected-access
 """Core processing engine for the agent, responsible for orchestrating the main loop.
 
 This module defines the `AgentLoop` class, which is the central component of the
@@ -55,8 +55,8 @@ from nanobot import __version__
 from nanobot.agent.commands import CommandHandler
 from nanobot.agent.context import ContextBuilder
 from nanobot.agent.memory import MemoryConsolidator
+from nanobot.agent.skills import BUILTIN_SKILLS_DIR
 from nanobot.agent.subagent import SubagentManager
-from nanobot.agent.skills import SkillsLoader, BUILTIN_SKILLS_DIR
 from nanobot.agent.tools.cron import CronTool
 from nanobot.agent.tools.filesystem import (
     EditFileTool,
@@ -75,7 +75,6 @@ from nanobot.bus.queue import MessageBus
 from nanobot.config.schema import ExecToolConfig, WebSearchConfig
 from nanobot.providers.base import LLMProvider, ToolCall
 from nanobot.session.manager import Session, SessionManager
-from nanobot.utils.helpers import build_status_content, build_help_content
 
 if TYPE_CHECKING:
     from nanobot.config.schema import (
@@ -254,16 +253,15 @@ class AgentLoop:
         self._mcp_connecting = True
         try:
             self._mcp_stack = AsyncExitStack()
-            await self._mcp_stack.__aenter__()
-            await connect_mcp_servers(self._mcp_servers, self.tools, self._mcp_stack)
+            await self._mcp_stack.enter_async_context(connect_mcp_servers(self._mcp_servers, self.tools, self._mcp_stack))
             self._mcp_connected = True
-        except BaseException as e:
+        except Exception as e:
             logger.error(f"Failed to connect MCP servers (will retry on next message): {e}")
             if self._mcp_stack:
                 try:
-                    await self._mcp_stack.__aexit__(None, None, None)
-                except Exception:
-                    pass
+                    await self._mcp_stack.aclose()
+                except Exception as e_inner:
+                    logger.error(f"Error closing MCP stack: {e_inner}")
                 self._mcp_stack = None
         finally:
             self._mcp_connecting = False
@@ -445,7 +443,12 @@ class AgentLoop:
                 logger.warning(f"Error consuming inbound message: {e}, continuing...")
                 continue
 
-            if await self.command_handler.handle(msg):
+            cmd = msg.content.strip().lower()
+            if cmd == "/stop":
+                await self.command_handler.handle_stop(msg)
+                continue
+            if cmd == "/restart":
+                await self.command_handler.handle_restart(msg)
                 continue
 
             task = asyncio.create_task(self._dispatch(msg))
@@ -467,7 +470,7 @@ class AgentLoop:
         """
         async with self._processing_lock:
             try:
-                if await self.command_handler.handle(msg):
+                if await self.command_handler.handle_queued(msg):
                     return
 
                 response = await self._process_message(msg)
@@ -504,9 +507,9 @@ class AgentLoop:
             self._background_tasks.clear()
         if self._mcp_stack:
             try:
-                await self._mcp_stack.__aexit__(None, None, None)
-            except Exception:
-                pass  # MCP SDK cancel scope cleanup is noisy but harmless
+                await self._mcp_stack.aclose()
+            except Exception as e:
+                logger.warning(f"Error closing MCP stack: {e}")
             self._mcp_stack = None
 
     def _schedule_background(self, coro: Awaitable[Any]) -> None:
@@ -558,9 +561,6 @@ class AgentLoop:
         key = session_key or msg.session_key
         session = self.sessions.get_or_create(key)
 
-        if await self.command_handler.handle(msg):
-            return None
-
         await self.memory_consolidator.maybe_consolidate_by_tokens(session)
 
         self._set_tool_context(
@@ -609,7 +609,7 @@ class AgentLoop:
         if (
             (mt := self.tools.get("message"))
             and isinstance(mt, MessageTool)
-            and mt._sent_in_turn
+            and mt.sent_in_turn
         ):
             return None
 
@@ -716,7 +716,7 @@ class AgentLoop:
                 drop_runtime
                 and block.get("type") == "text"
                 and isinstance(block.get("text"), str)
-                and block["text"].startswith(ContextBuilder._RUNTIME_CONTEXT_TAG)
+                and block["text"].startswith(self.context.RUNTIME_CONTEXT_TAG)
             ):
                 continue
 
@@ -772,7 +772,7 @@ class AgentLoop:
                     entry["content"] = filtered
             elif role == "user":
                 if isinstance(content, str) and content.startswith(
-                    ContextBuilder._RUNTIME_CONTEXT_TAG
+                    self.context.RUNTIME_CONTEXT_TAG
                 ):
                     # Strip the runtime-context prefix, keep only the user text.
                     parts = content.split("\n\n", 1)
