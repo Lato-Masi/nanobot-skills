@@ -41,7 +41,7 @@ class ToolRegistry:
 
         tool = self._tools.get(name)
         if not tool:
-            return f'Error: Tool \'{name}\' not found. Available: {\', '.join(self.tool_names)}'
+            return f'Error: Tool \'{name}\' not found. Available: {', '.join(self.tool_names)}'
 
         try:
             # Attempt to cast parameters to match schema types

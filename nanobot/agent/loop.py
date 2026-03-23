@@ -1,16 +1,47 @@
-"""Agent loop: the core processing engine."""
+"""Core processing engine for the agent, responsible for orchestrating the main loop.
+
+This module defines the `AgentLoop` class, which is the central component of the
+nanobot agent. It orchestrates the entire process of receiving messages,
+interacting with the language model, executing tools, and sending responses.
+
+The `AgentLoop` is responsible for:
+- Managing the main event loop and gracefully handling shutdown signals.
+- Consuming inbound messages from the message bus.
+- Dispatching messages to dedicated processing tasks to maintain responsiveness.
+- Handling system-level commands like `/stop`, `/restart`, and `/status`.
+- Building the context for the language model, including history, memory, and skills.
+- Calling the language model and processing its responses.
+- Executing tool calls and incorporating the results into the conversation.
+- Managing session history and memory consolidation.
+- Interfacing with sub-agents and other external services.
+
+The module is designed to be highly asynchronous, leveraging `asyncio` to handle
+concurrent operations and I/O-bound tasks efficiently. It follows a modular
+and extensible architecture, allowing for the easy integration of new tools,
+channels, and providers.
+"""
 
 from __future__ import annotations
 
 import asyncio
 import json
-import re
 import os
+import re
 import sys
 import time
 from contextlib import AsyncExitStack
+from datetime import datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Awaitable, Callable, Dict, List, Optional, Tuple
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Awaitable,
+    Callable,
+    Dict,
+    List,
+    Optional,
+    Tuple,
+)
 
 from loguru import logger
 
@@ -18,40 +49,60 @@ from nanobot import __version__
 from nanobot.agent.context import ContextBuilder
 from nanobot.agent.memory import MemoryConsolidator
 from nanobot.agent.subagent import SubagentManager
-from nanobot.agent.tools.cron import CronTool
 from nanobot.agent.skills import BUILTIN_SKILLS_DIR
+from nanobot.agent.tools.cron import CronTool
 from nanobot.agent.tools.filesystem import (
     EditFileTool,
     ListDirTool,
     ReadFileTool,
     WriteFileTool,
 )
+from nanobot.agent.tools.mcp import connect_mcp_servers
 from nanobot.agent.tools.message import MessageTool
 from nanobot.agent.tools.registry import ToolRegistry
 from nanobot.agent.tools.shell import ExecTool
 from nanobot.agent.tools.spawn import SpawnTool
 from nanobot.agent.tools.web import WebFetchTool, WebSearchTool
 from nanobot.bus.events import InboundMessage, OutboundMessage
-from nanobot.utils.helpers import build_status_content
 from nanobot.bus.queue import MessageBus
+from nanobot.config.schema import ExecToolConfig, WebSearchConfig
 from nanobot.providers.base import LLMProvider, ToolCall
 from nanobot.session.manager import Session, SessionManager
+from nanobot.utils.helpers import build_status_content
 
 if TYPE_CHECKING:
-    from nanobot.config.schema import ChannelsConfig, ExecToolConfig, WebSearchConfig
+    from nanobot.config.schema import (
+        ChannelsConfig,
+        ExecToolConfig,
+        WebSearchConfig,
+    )
     from nanobot.cron.service import CronService
 
 
 class AgentLoop:
-    """
-    The agent loop is the core processing engine.
+    """The core processing engine of the nanobot agent.
 
-    It:
-    1. Receives messages from the bus
-    2. Builds context with history, memory, skills
-    3. Calls the LLM
-    4. Executes tool calls
-    5. Sends responses back
+    This class orchestrates the main loop of the agent, handling message
+    processing, interaction with the language model, tool execution, and
+    session management.
+
+    Attributes:
+        bus: An instance of `MessageBus` for communication with other components.
+        provider: An instance of a `LLMProvider` for interacting with the language model.
+        workspace: The root directory of the agent's workspace.
+        model: The name of the language model to use.
+        max_iterations: The maximum number of tool call iterations per turn.
+        context_window_tokens: The context window size of the language model.
+        web_search_config: Configuration for the web search tool.
+        web_proxy: The proxy to use for web requests.
+        exec_config: Configuration for the shell execution tool.
+        cron_service: An instance of `CronService` for scheduled tasks.
+        restrict_to_workspace: Whether to restrict file system access to the workspace.
+        context: An instance of `ContextBuilder` for building the LLM context.
+        sessions: An instance of `SessionManager` for managing user sessions.
+        tools: An instance of `ToolRegistry` for managing available tools.
+        subagents: An instance of `SubagentManager` for managing sub-agents.
+        memory_consolidator: An instance of `MemoryConsolidator` for managing memory.
     """
 
     _TOOL_RESULT_MAX_CHARS: int = 16_000
@@ -73,27 +124,43 @@ class AgentLoop:
         mcp_servers: Optional[Dict[str, Any]] = None,
         channels_config: Optional[ChannelsConfig] = None,
     ) -> None:
-        from nanobot.config.schema import ExecToolConfig, WebSearchConfig
+        """Initializes the AgentLoop.
 
-        self.bus: MessageBus = bus
-        self.channels_config: Optional[ChannelsConfig] = channels_config
-        self.provider: LLMProvider = provider
-        self.workspace: Path = workspace
-        self.model: str = model or provider.get_default_model()
-        self.max_iterations: int = max_iterations
-        self.context_window_tokens: int = context_window_tokens
-        self.web_search_config: WebSearchConfig = web_search_config or WebSearchConfig()
-        self.web_proxy: Optional[str] = web_proxy
-        self.exec_config: ExecToolConfig = exec_config or ExecToolConfig()
-        self.cron_service: Optional[CronService] = cron_service
-        self.restrict_to_workspace: bool = restrict_to_workspace
-        self._start_time: float = time.time()
+        Args:
+            bus: The message bus for communication.
+            provider: The language model provider.
+            workspace: The agent's workspace directory.
+            model: The name of the language model to use.
+            max_iterations: Max tool call iterations per turn.
+            context_window_tokens: The context window size of the LLM.
+            web_search_config: Configuration for the web search tool.
+            web_proxy: Proxy for web requests.
+            exec_config: Configuration for the shell execution tool.
+            cron_service: The cron service for scheduled tasks.
+            restrict_to_workspace: Restrict file system access to the workspace.
+            session_manager: The session manager.
+            mcp_servers: Configuration for MCP servers.
+            channels_config: Configuration for the channels.
+        """
+        self.bus = bus
+        self.channels_config = channels_config
+        self.provider = provider
+        self.workspace = workspace
+        self.model = model or provider.get_default_model()
+        self.max_iterations = max_iterations
+        self.context_window_tokens = context_window_tokens
+        self.web_search_config = web_search_config or WebSearchConfig()
+        self.web_proxy = web_proxy
+        self.exec_config = exec_config or ExecToolConfig()
+        self.cron_service = cron_service
+        self.restrict_to_workspace = restrict_to_workspace
+        self._start_time = time.time()
         self._last_usage: Dict[str, int] = {}
 
-        self.context: ContextBuilder = ContextBuilder(workspace)
-        self.sessions: SessionManager = session_manager or SessionManager(workspace)
-        self.tools: ToolRegistry = ToolRegistry()
-        self.subagents: SubagentManager = SubagentManager(
+        self.context = ContextBuilder(workspace)
+        self.sessions = session_manager or SessionManager(workspace)
+        self.tools = ToolRegistry()
+        self.subagents = SubagentManager(
             provider=provider,
             workspace=workspace,
             bus=bus,
@@ -104,15 +171,15 @@ class AgentLoop:
             restrict_to_workspace=self.restrict_to_workspace,
         )
 
-        self._running: bool = False
-        self._mcp_servers: Dict[str, Any] = mcp_servers or {}
+        self._running = False
+        self._mcp_servers = mcp_servers or {}
         self._mcp_stack: Optional[AsyncExitStack] = None
-        self._mcp_connected: bool = False
-        self._mcp_connecting: bool = False
+        self._mcp_connected = False
+        self._mcp_connecting = False
         self._active_tasks: Dict[str, List[asyncio.Task[Any]]] = {}
         self._background_tasks: List[asyncio.Task[Any]] = []
-        self._processing_lock: asyncio.Lock = asyncio.Lock()
-        self.memory_consolidator: MemoryConsolidator = MemoryConsolidator(
+        self._processing_lock = asyncio.Lock()
+        self.memory_consolidator = MemoryConsolidator(
             workspace=workspace,
             provider=provider,
             model=self.model,
@@ -124,7 +191,7 @@ class AgentLoop:
         self._register_default_tools()
 
     def _register_default_tools(self) -> None:
-        """Register the default set of tools."""
+        """Registers the default set of tools available to the agent."""
         allowed_dir = self.workspace if self.restrict_to_workspace else None
         extra_read = [BUILTIN_SKILLS_DIR] if allowed_dir else None
         self.tools.register(
@@ -145,7 +212,9 @@ class AgentLoop:
                     path_append=self.exec_config.path_append,
                 )
             )
-        self.tools.register(WebSearchTool(config=self.web_search_config, proxy=self.web_proxy))
+        self.tools.register(
+            WebSearchTool(config=self.web_search_config, proxy=self.web_proxy)
+        )
         self.tools.register(WebFetchTool(proxy=self.web_proxy))
         self.tools.register(MessageTool(send_callback=self.bus.publish_outbound))
         self.tools.register(SpawnTool(manager=self.subagents))
@@ -153,19 +222,18 @@ class AgentLoop:
             self.tools.register(CronTool(self.cron_service))
 
     async def _connect_mcp(self) -> None:
-        """Connect to configured MCP servers (one-time, lazy)."""
+        """Connects to configured MCP servers (one-time, lazy)."""
         if self._mcp_connected or self._mcp_connecting or not self._mcp_servers:
             return
         self._mcp_connecting = True
-        from nanobot.agent.tools.mcp import connect_mcp_servers
 
         try:
-            self._mcp_stack = AsyncExitStack()
-            await self._mcp_stack.__aenter__()
-            await connect_mcp_servers(self._mcp_servers, self.tools, self._mcp_stack)
-            self._mcp_connected = True
+            async with AsyncExitStack() as stack:
+                self._mcp_stack = stack
+                await connect_mcp_servers(self._mcp_servers, self.tools, self._mcp_stack)
+                self._mcp_connected = True
         except BaseException as e:
-            logger.error("Failed to connect MCP servers (will retry next message): {}", e)
+            logger.error(f"Failed to connect MCP servers (will retry on next message): {e}")
             if self._mcp_stack:
                 try:
                     await self._mcp_stack.__aexit__(None, None, None)
@@ -178,7 +246,7 @@ class AgentLoop:
     def _set_tool_context(
         self, channel: str, chat_id: str, message_id: Optional[str] = None
     ) -> None:
-        """Update context for all tools that need routing info."""
+        """Updates the context for all tools that require routing information."""
         for name in ("message", "spawn", "cron"):
             if tool := self.tools.get(name):
                 if hasattr(tool, "set_context"):
@@ -188,14 +256,30 @@ class AgentLoop:
 
     @staticmethod
     def _strip_think(text: Optional[str]) -> Optional[str]:
-        """Remove <think>…</think> blocks that some models embed in content."""
+        """Removes <think>...</think> blocks from the given text.
+
+        Args:
+            text: The text to process.
+
+        Returns:
+            The text with the <think> blocks removed, or None if the input is None.
+        """
         if not text:
             return None
         return re.sub(r"<think>[\s\S]*?</think>", "", text).strip() or None
 
     @staticmethod
     def _tool_hint(tool_calls: List[ToolCall]) -> str:
-        """Format tool calls as concise hint, e.g. 'web_search("query")'."""
+        """Formats a list of tool calls into a concise hint string.
+
+        For example: 'web_search("query")'.
+
+        Args:
+            tool_calls: A list of `ToolCall` objects.
+
+        Returns:
+            A string representing a concise hint of the tool calls.
+        """
 
         def _fmt(tc: ToolCall) -> str:
             args = (
@@ -205,12 +289,20 @@ class AgentLoop:
             val = next(iter(args.values()), None) if isinstance(args, dict) else None
             if not isinstance(val, str):
                 return tc.name
-            return f'{tc.name}("{val[:40]}…")' if len(val) > 40 else f'{tc.name}("{val}")'
+            return f'{tc.name}("{val[:40]}...")' if len(val) > 40 else f'{tc.name}("{val}")'
 
         return ", ".join(_fmt(tc) for tc in tool_calls)
 
     def _status_response(self, msg: InboundMessage, session: Session) -> OutboundMessage:
-        """Build an outbound status message for a session."""
+        """Builds an outbound status message for a given session.
+
+        Args:
+            msg: The inbound message that triggered the status request.
+            session: The user session.
+
+        Returns:
+            An `OutboundMessage` containing the status information.
+        """
         ctx_est = 0
         try:
             ctx_est, _ = self.memory_consolidator.estimate_session_prompt_tokens(session)
@@ -238,7 +330,22 @@ class AgentLoop:
         initial_messages: List[Dict[str, Any]],
         on_progress: Optional[Callable[..., Awaitable[None]]] = None,
     ) -> Tuple[Optional[str], List[str], List[Dict[str, Any]]]:
-        """Run the agent iteration loop."""
+        """Runs the main agent iteration loop.
+
+        This method repeatedly calls the language model, executes tool calls,
+        and builds the conversation history until a final response is generated
+        or the maximum number of iterations is reached.
+
+        Args:
+            initial_messages: The initial list of messages to start the loop with.
+            on_progress: An optional callback to report progress during the loop.
+
+        Returns:
+            A tuple containing:
+            - The final content of the agent's response.
+            - A list of the names of the tools used during the loop.
+            - The complete list of messages in the conversation history.
+        """
         messages: List[Dict[str, Any]] = initial_messages
         iteration = 0
         final_content: Optional[str] = None
@@ -284,17 +391,19 @@ class AgentLoop:
                 for tool_call in response.tool_calls:
                     tools_used.append(tool_call.name)
                     args_str = json.dumps(tool_call.arguments, ensure_ascii=False)
-                    logger.info("Tool call: {}({})", tool_call.name, args_str[:200])
-                    result = await self.tools.execute(tool_call.name, tool_call.arguments)
+                    logger.info(f"Tool call: {tool_call.name}({args_str[:200]})")
+                    result = await self.tools.execute(
+                        tool_call.name, tool_call.arguments
+                    )
                     messages = self.context.add_tool_result(
                         messages, tool_call.id, tool_call.name, result
                     )
             else:
                 clean = self._strip_think(response.content)
-                # Don't persist error responses to session history — they can
-                # poison the context and cause permanent 400 loops (#1303).
+                # Don't persist error responses to session history, as they can
+                # poison the context and cause permanent 400 loops.
                 if response.finish_reason == "error":
-                    logger.error("LLM returned error: {}", (clean or "")[:200])
+                    logger.error(f"LLM returned error: {(clean or '')[:200]}")
                     final_content = (
                         clean or "Sorry, I encountered an error calling the AI model."
                     )
@@ -309,7 +418,7 @@ class AgentLoop:
                 break
 
         if final_content is None and iteration >= self.max_iterations:
-            logger.warning("Max iterations ({}) reached", self.max_iterations)
+            logger.warning(f"Max iterations ({self.max_iterations}) reached")
             final_content = (
                 f"I reached the maximum number of tool call iterations ({self.max_iterations}) "
                 "without completing the task. You can try breaking the task into smaller steps."
@@ -318,7 +427,12 @@ class AgentLoop:
         return final_content, tools_used, messages
 
     async def run(self) -> None:
-        """Run the agent loop, dispatching messages as tasks to stay responsive to /stop."""
+        """Runs the main agent loop, dispatching messages as tasks.
+
+        This method continuously consumes messages from the inbound message bus
+        and dispatches them to the `_dispatch` method for processing. It also
+        handles system-level commands like `/stop` and `/restart`.
+        """
         self._running = True
         await self._connect_mcp()
         logger.info("Agent loop started")
@@ -331,12 +445,11 @@ class AgentLoop:
             except asyncio.CancelledError:
                 task = asyncio.current_task()
                 # Preserve real task cancellation so shutdown can complete cleanly.
-                # Only ignore non-task CancelledError signals that may leak from integrations.
                 if not self._running or (task and task.cancelling()):
                     raise
                 continue
             except Exception as e:
-                logger.warning("Error consuming inbound message: {}, continuing...", e)
+                logger.warning(f"Error consuming inbound message: {e}, continuing...")
                 continue
 
             cmd = msg.content.strip().lower()
@@ -358,7 +471,11 @@ class AgentLoop:
                 )
 
     async def _handle_stop(self, msg: InboundMessage) -> None:
-        """Cancel all active tasks and subagents for the session."""
+        """Handles the /stop command by canceling active tasks for the session.
+
+        Args:
+            msg: The inbound message containing the /stop command.
+        """
         tasks = self._active_tasks.pop(msg.session_key, [])
         cancelled = sum(1 for t in tasks if not t.done() and t.cancel())
         for t in tasks:
@@ -370,13 +487,15 @@ class AgentLoop:
         total = cancelled + sub_cancelled
         content = f"Stopped {total} task(s)." if total else "No active task to stop."
         await self.bus.publish_outbound(
-            OutboundMessage(
-                channel=msg.channel, chat_id=msg.chat_id, content=content
-            )
+            OutboundMessage(channel=msg.channel, chat_id=msg.chat_id, content=content)
         )
 
     async def _handle_restart(self, msg: InboundMessage) -> None:
-        """Restart the process in-place via os.execv."""
+        """Handles the /restart command by restarting the process in-place.
+
+        Args:
+            msg: The inbound message containing the /restart command.
+        """
         await self.bus.publish_outbound(
             OutboundMessage(
                 channel=msg.channel, chat_id=msg.chat_id, content="Restarting..."
@@ -385,14 +504,19 @@ class AgentLoop:
 
         async def _do_restart() -> None:
             await asyncio.sleep(1)
-            # Use -m nanobot instead of sys.argv[0] for Windows compatibility
-            # (sys.argv[0] may be just "nanobot" without full path on Windows)
+            # Use -m nanobot instead of sys.argv[0] for Windows compatibility.
             os.execv(sys.executable, [sys.executable, "-m", "nanobot"] + sys.argv[1:])
 
         asyncio.create_task(_do_restart())
 
     async def _dispatch(self, msg: InboundMessage) -> None:
-        """Process a message under the global lock."""
+        """Dispatches a message to the `_process_message` method under a global lock.
+
+        This ensures that only one message is being processed at a time.
+
+        Args:
+            msg: The inbound message to process.
+        """
         async with self._processing_lock:
             try:
                 response = await self._process_message(msg)
@@ -408,11 +532,11 @@ class AgentLoop:
                         )
                     )
             except asyncio.CancelledError:
-                logger.info("Task cancelled for session {}", msg.session_key)
+                logger.info(f"Task cancelled for session {msg.session_key}")
                 raise
             except Exception:
                 logger.exception(
-                    "Error processing message for session {}", msg.session_key
+                    f"Error processing message for session {msg.session_key}"
                 )
                 await self.bus.publish_outbound(
                     OutboundMessage(
@@ -423,7 +547,7 @@ class AgentLoop:
                 )
 
     async def close_mcp(self) -> None:
-        """Drain pending background archives, then close MCP connections."""
+        """Drains pending background archives, then closes MCP connections."""
         if self._background_tasks:
             await asyncio.gather(*self._background_tasks, return_exceptions=True)
             self._background_tasks.clear()
@@ -435,13 +559,19 @@ class AgentLoop:
             self._mcp_stack = None
 
     def _schedule_background(self, coro: Awaitable[Any]) -> None:
-        """Schedule a coroutine as a tracked background task (drained on shutdown)."""
+        """Schedules a coroutine as a tracked background task.
+
+        The task is drained on shutdown.
+
+        Args:
+            coro: The coroutine to schedule.
+        """
         task = asyncio.create_task(coro)
         self._background_tasks.append(task)
         task.add_done_callback(lambda _t: self._background_tasks.remove(task))
 
     def stop(self) -> None:
-        """Stop the agent loop."""
+        """Stops the agent loop."""
         self._running = False
         logger.info("Agent loop stopping")
 
@@ -451,89 +581,41 @@ class AgentLoop:
         session_key: Optional[str] = None,
         on_progress: Optional[Callable[..., Awaitable[None]]] = None,
     ) -> Optional[OutboundMessage]:
-        """Process a single inbound message and return the response."""
-        # System messages: parse origin from chat_id ("channel:chat_id")
+        """Processes a single inbound message and returns the response.
+
+        This is the main message processing method, which handles everything
+        from slash commands to running the agent loop.
+
+        Args:
+            msg: The inbound message to process.
+            session_key: The session key to use, if different from the message.
+            on_progress: An optional callback to report progress.
+
+        Returns:
+            An `OutboundMessage` to be sent back to the user, or None.
+        """
         if msg.channel == "system":
-            channel, chat_id = (
-                msg.chat_id.split(":", 1)
-                if ":" in msg.chat_id
-                else ("cli", msg.chat_id)
-            )
-            logger.info("Processing system message from {}", msg.sender_id)
-            key = f"{channel}:{chat_id}"
-            session = self.sessions.get_or_create(key)
-            await self.memory_consolidator.maybe_consolidate_by_tokens(session)
-            self._set_tool_context(channel, chat_id, msg.metadata.get("message_id"))
-            history = session.get_history(max_messages=0)
-            # Subagent results should be assistant role, other system messages use user role
-            current_role = "assistant" if msg.sender_id == "subagent" else "user"
-            messages = self.context.build_messages(
-                history=history,
-                current_message=msg.content,
-                channel=channel,
-                chat_id=chat_id,
-                current_role=current_role,
-            )
-            final_content, _, all_msgs = await self._run_agent_loop(messages)
-            self._save_turn(session, all_msgs, 1 + len(history))
-            self.sessions.save(session)
-            self._schedule_background(
-                self.memory_consolidator.maybe_consolidate_by_tokens(session)
-            )
-            return OutboundMessage(
-                channel=channel,
-                chat_id=chat_id,
-                content=final_content or "Background task completed.",
-            )
+            return await self._process_system_message(msg)
 
         preview = (
-            msg.content[:80] + "..." if len(msg.content) > 80 else msg.content
+            f"{msg.content[:80]}..." if len(msg.content) > 80 else msg.content
         )
         logger.info(
-            "Processing message from {}:{}: {}", msg.channel, msg.sender_id, preview
+            f"Processing message from {msg.channel}:{msg.sender_id}: {preview}"
         )
 
         key = session_key or msg.session_key
         session = self.sessions.get_or_create(key)
 
-        # Slash commands
-        cmd = msg.content.strip().lower()
-        if cmd == "/new":
-            snapshot = session.messages[session.last_consolidated :]
-            session.clear()
-            self.sessions.save(session)
-            self.sessions.invalidate(session.key)
+        # Handle slash commands
+        if response := await self._handle_slash_commands(msg, session):
+            return response
 
-            if snapshot:
-                self._schedule_background(
-                    self.memory_consolidator.archive_messages(snapshot)
-                )
-
-            return OutboundMessage(
-                channel=msg.channel,
-                chat_id=msg.chat_id,
-                content="New session started.",
-            )
-        if cmd == "/status":
-            return self._status_response(msg, session)
-        if cmd == "/help":
-            lines = [
-                "🐈 nanobot commands:",
-                "/new — Start a new conversation",
-                "/stop — Stop the current task",
-                "/restart — Restart the bot",
-                "/status — Show bot status",
-                "/help — Show available commands",
-            ]
-            return OutboundMessage(
-                channel=msg.channel,
-                chat_id=msg.chat_id,
-                content="\n".join(lines),
-                metadata={"render_as": "text"},
-            )
         await self.memory_consolidator.maybe_consolidate_by_tokens(session)
 
-        self._set_tool_context(msg.channel, msg.chat_id, msg.metadata.get("message_id"))
+        self._set_tool_context(
+            msg.channel, msg.chat_id, msg.metadata.get("message_id")
+        )
         if message_tool := self.tools.get("message"):
             if isinstance(message_tool, MessageTool):
                 message_tool.start_turn()
@@ -582,11 +664,13 @@ class AgentLoop:
             return None
 
         preview = (
-            final_content[:120] + "..."
+            f"{final_content[:120]}..."
             if len(final_content) > 120
             else final_content
         )
-        logger.info("Response to {}:{}: {}", msg.channel, msg.sender_id, preview)
+        logger.info(
+            f"Response to {msg.channel}:{msg.sender_id}: {preview}"
+        )
         return OutboundMessage(
             channel=msg.channel,
             chat_id=msg.chat_id,
@@ -594,9 +678,108 @@ class AgentLoop:
             metadata=msg.metadata or {},
         )
 
+    async def _process_system_message(
+        self, msg: InboundMessage
+    ) -> Optional[OutboundMessage]:
+        """Processes a system message.
+
+        System messages are used for internal communication, such as sub-agent
+        results or memory consolidation.
+
+        Args:
+            msg: The system message to process.
+
+        Returns:
+            An `OutboundMessage` to be sent back to the user, or None.
+        """
+        channel, chat_id = (
+            msg.chat_id.split(":", 1) if ":" in msg.chat_id else ("cli", msg.chat_id)
+        )
+        logger.info(f"Processing system message from {msg.sender_id}")
+        key = f"{channel}:{chat_id}"
+        session = self.sessions.get_or_create(key)
+        await self.memory_consolidator.maybe_consolidate_by_tokens(session)
+        self._set_tool_context(channel, chat_id, msg.metadata.get("message_id"))
+        history = session.get_history(max_messages=0)
+        # Subagent results should be assistant role, other system messages use user role
+        current_role = "assistant" if msg.sender_id == "subagent" else "user"
+        messages = self.context.build_messages(
+            history=history,
+            current_message=msg.content,
+            channel=channel,
+            chat_id=chat_id,
+            current_role=current_role,
+        )
+        final_content, _, all_msgs = await self._run_agent_loop(messages)
+        self._save_turn(session, all_msgs, 1 + len(history))
+        self.sessions.save(session)
+        self._schedule_background(
+            self.memory_consolidator.maybe_consolidate_by_tokens(session)
+        )
+        return OutboundMessage(
+            channel=channel,
+            chat_id=chat_id,
+            content=final_content or "Background task completed.",
+        )
+
+    async def _handle_slash_commands(
+        self, msg: InboundMessage, session: Session
+    ) -> Optional[OutboundMessage]:
+        """Handles slash commands.
+
+        Args:
+            msg: The inbound message.
+            session: The user session.
+
+        Returns:
+            An `OutboundMessage` if the command is handled, otherwise None.
+        """
+        cmd = msg.content.strip().lower()
+        if cmd == "/new":
+            snapshot = session.messages[session.last_consolidated :]
+            session.clear()
+            self.sessions.save(session)
+            self.sessions.invalidate(session.key)
+
+            if snapshot:
+                self._schedule_background(
+                    self.memory_consolidator.archive_messages(snapshot)
+                )
+
+            return OutboundMessage(
+                channel=msg.channel,
+                chat_id=msg.chat_id,
+                content="New session started.",
+            )
+        if cmd == "/status":
+            return self._status_response(msg, session)
+        if cmd == "/help":
+            lines = [
+                "🐈 nanobot commands:",
+                "/new — Start a new conversation",
+                "/stop — Stop the current task",
+                "/restart — Restart the bot",
+                "/status — Show bot status",
+                "/help — Show available commands",
+            ]
+            return OutboundMessage(
+                channel=msg.channel,
+                chat_id=msg.chat_id,
+                content="\n".join(lines),
+                metadata={"render_as": "text"},
+            )
+        return None
+
     @staticmethod
     def _image_placeholder(block: Dict[str, Any]) -> Dict[str, str]:
-        """Convert an inline image block into a compact text placeholder."""
+        """Converts an inline image block into a compact text placeholder.
+
+        Args:
+            block: The image block.
+
+        Returns:
+            A text block with a placeholder for the image.
+        """
         path = (block.get("_meta") or {}).get("path", "")
         return {"type": "text", "text": f"[image: {path}]" if path else "[image]"}
 
@@ -607,7 +790,16 @@ class AgentLoop:
         truncate_text: bool = False,
         drop_runtime: bool = False,
     ) -> List[Dict[str, Any]]:
-        """Strip volatile multimodal payloads before writing session history."""
+        """Strips volatile multimodal payloads before writing session history.
+
+        Args:
+            content: A list of message content blocks.
+            truncate_text: Whether to truncate long text blocks.
+            drop_runtime: Whether to drop runtime context blocks.
+
+        Returns:
+            A list of sanitized message content blocks.
+        """
         filtered: List[Dict[str, Any]] = []
         for block in content:
             if not isinstance(block, dict):
@@ -632,7 +824,7 @@ class AgentLoop:
             if block.get("type") == "text" and isinstance(block.get("text"), str):
                 text = block["text"]
                 if truncate_text and len(text) > self._TOOL_RESULT_MAX_CHARS:
-                    text = text[: self._TOOL_RESULT_MAX_CHARS] + "\n... (truncated)"
+                    text = f"{text[: self._TOOL_RESULT_MAX_CHARS]}\n... (truncated)"
                 filtered.append({**block, "text": text})
                 continue
 
@@ -640,22 +832,30 @@ class AgentLoop:
 
         return filtered
 
-    def _save_turn(self, session: Session, messages: List[Dict[str, Any]], skip: int) -> None:
-        """Save new-turn messages into session, truncating large tool results."""
-        from datetime import datetime
+    def _save_turn(
+        self, session: Session, messages: List[Dict[str, Any]], skip: int
+    ) -> None:
+        """Saves the new messages from a turn into the session history.
 
+        Large tool results are truncated to save space.
+
+        Args:
+            session: The user session.
+            messages: The list of messages from the turn.
+            skip: The number of messages to skip from the beginning of the list.
+        """
         for m in messages[skip:]:
             entry = dict(m)
             role, content = entry.get("role"), entry.get("content")
             if role == "assistant" and not content and not entry.get("tool_calls"):
-                continue  # skip empty assistant messages — they poison session context
+                continue  # skip empty assistant messages
             if role == "tool":
                 if (
                     isinstance(content, str)
                     and len(content) > self._TOOL_RESULT_MAX_CHARS
                 ):
                     entry["content"] = (
-                        content[: self._TOOL_RESULT_MAX_CHARS] + "\n... (truncated)"
+                        f"{content[: self._TOOL_RESULT_MAX_CHARS]}\n... (truncated)"
                     )
                 elif isinstance(content, list):
                     filtered = self._sanitize_persisted_blocks(
@@ -675,7 +875,9 @@ class AgentLoop:
                     else:
                         continue
                 if isinstance(content, list):
-                    filtered = self._sanitize_persisted_blocks(content, drop_runtime=True)
+                    filtered = self._sanitize_persisted_blocks(
+                        content, drop_runtime=True
+                    )
                     if not filtered:
                         continue
                     entry["content"] = filtered
@@ -691,7 +893,21 @@ class AgentLoop:
         chat_id: str = "direct",
         on_progress: Optional[Callable[..., Awaitable[None]]] = None,
     ) -> Optional[OutboundMessage]:
-        """Process a message directly and return the outbound payload."""
+        """Processes a message directly and returns the outbound payload.
+
+        This method is useful for testing or for integrating with other systems
+        that don't use the message bus.
+
+        Args:
+            content: The content of the message to process.
+            session_key: The session key to use.
+            channel: The channel to use.
+            chat_id: The chat ID to use.
+            on_progress: An optional callback to report progress.
+
+        Returns:
+            An `OutboundMessage` to be sent back to the user, or None.
+        """
         await self._connect_mcp()
         msg = InboundMessage(
             channel=channel, sender_id="user", chat_id=chat_id, content=content
