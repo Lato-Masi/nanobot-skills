@@ -31,9 +31,7 @@ from __future__ import annotations
 
 import asyncio
 import json
-import os
 import re
-import sys
 import time
 from contextlib import AsyncExitStack
 from datetime import datetime
@@ -57,6 +55,7 @@ from nanobot.agent.context import ContextBuilder
 from nanobot.agent.memory import MemoryConsolidator
 from nanobot.agent.skills import BUILTIN_SKILLS_DIR
 from nanobot.agent.subagent import SubagentManager
+from nanobot.agent.tools.base import ToolCall
 from nanobot.agent.tools.cron import CronTool
 from nanobot.agent.tools.filesystem import (
     EditFileTool,
@@ -72,17 +71,18 @@ from nanobot.agent.tools.spawn import SpawnTool
 from nanobot.agent.tools.web import WebFetchTool, WebSearchTool
 from nanobot.bus.events import InboundMessage, OutboundMessage
 from nanobot.bus.queue import MessageBus
-from nanobot.config.schema import ExecToolConfig, WebSearchConfig
-from nanobot.providers.base import LLMProvider, ToolCall
-from nanobot.session.manager import Session, SessionManager
+from nanobot.session import Session, SessionManager
 
 if TYPE_CHECKING:
+    from nanobot.config import Config
     from nanobot.config.schema import (
         ChannelsConfig,
     )
     from nanobot.cron.service import CronService
+    from nanobot.providers.base import LLMProvider
 
 
+# pylint: disable=too-many-instance-attributes
 class AgentLoop:
     """The core processing engine of the nanobot agent.
 
@@ -111,53 +111,46 @@ class AgentLoop:
 
     _TOOL_RESULT_MAX_CHARS: int = 16_000
 
+    # pylint: disable=too-many-statements
     def __init__(
         self,
+        config: Config,
         bus: MessageBus,
         provider: LLMProvider,
         workspace: Path,
-        model: Optional[str] = None,
-        max_iterations: int = 40,
-        context_window_tokens: int = 65_536,
-        web_search_config: Optional[WebSearchConfig] = None,
-        web_proxy: Optional[str] = None,
-        exec_config: Optional[ExecToolConfig] = None,
         cron_service: Optional[CronService] = None,
-        restrict_to_workspace: bool = False,
         session_manager: Optional[SessionManager] = None,
-        mcp_servers: Optional[Dict[str, Any]] = None,
-        channels_config: Optional[ChannelsConfig] = None,
     ) -> None:
         """Initializes the AgentLoop.
 
         Args:
+            config: The main configuration object.
             bus: The message bus for communication.
             provider: The language model provider.
             workspace: The agent's workspace directory.
-            model: The name of the language model to use.
-            max_iterations: Max tool call iterations per turn.
-            context_window_tokens: The context window size of the LLM.
-            web_search_config: Configuration for the web search tool.
-            web_proxy: Proxy for web requests.
-            exec_config: Configuration for the shell execution tool.
             cron_service: The cron service for scheduled tasks.
-            restrict_to_workspace: Restrict file system access to the workspace.
             session_manager: The session manager.
-            mcp_servers: Configuration for MCP servers.
-            channels_config: Configuration for the channels.
         """
         self.bus = bus
-        self.channels_config = channels_config
         self.provider = provider
         self.workspace = workspace
-        self.model = model or provider.get_default_model()
-        self.max_iterations = max_iterations
-        self.context_window_tokens = context_window_tokens
-        self.web_search_config = web_search_config or WebSearchConfig()
-        self.web_proxy = web_proxy
-        self.exec_config = exec_config or ExecToolConfig()
         self.cron_service = cron_service
-        self.restrict_to_workspace = restrict_to_workspace
+
+        agent_defaults = config.agents.defaults
+        tools_config = config.tools
+        self.model = agent_defaults.model or provider.get_default_model()
+        if not self.model:
+            raise ValueError("No model specified and no default model available.")
+
+        self.max_iterations = agent_defaults.max_tool_iterations
+        self.context_window_tokens = agent_defaults.context_window_tokens
+        self.web_search_config = tools_config.web.search
+        self.web_proxy = tools_config.web.proxy
+        self.exec_config = tools_config.exec
+        self.restrict_to_workspace = tools_config.restrict_to_workspace
+        self._mcp_servers = tools_config.mcp_servers
+        self.channels_config = config.channels
+
         self._start_time = time.time()
         self._last_usage: Dict[str, int] = {}
 
@@ -170,13 +163,12 @@ class AgentLoop:
             bus=bus,
             model=self.model,
             web_search_config=self.web_search_config,
-            web_proxy=web_proxy,
+            web_proxy=self.web_proxy,
             exec_config=self.exec_config,
             restrict_to_workspace=self.restrict_to_workspace,
         )
 
         self._running = False
-        self._mcp_servers = mcp_servers or {}
         self._mcp_stack: Optional[AsyncExitStack] = None
         self._mcp_connected = False
         self._mcp_connecting = False
@@ -188,7 +180,7 @@ class AgentLoop:
             provider=provider,
             model=self.model,
             sessions=self.sessions,
-            context_window_tokens=context_window_tokens,
+            context_window_tokens=self.context_window_tokens,
             build_messages=self.context.build_messages,
             get_tool_definitions=self.tools.get_definitions,
         )
@@ -417,6 +409,14 @@ class AgentLoop:
 
         return final_content, tools_used, messages
 
+    def _task_done_callback(self, task: asyncio.Task[Any], key: str) -> None:
+        task_list = self._active_tasks.get(key)
+        if task_list:
+            try:
+                task_list.remove(task)
+            except ValueError:
+                pass  # Already removed
+
     async def run(self) -> None:
         """Runs the main agent loop, dispatching messages as tasks.
 
@@ -454,10 +454,7 @@ class AgentLoop:
             task = asyncio.create_task(self._dispatch(msg))
             self._active_tasks.setdefault(msg.session_key, []).append(task)
             task.add_done_callback(
-                lambda t, k=msg.session_key: self._active_tasks.get(k, [])
-                and self._active_tasks[k].remove(t)
-                if t in self._active_tasks.get(k, [])
-                else None
+                lambda t: self._task_done_callback(t, msg.session_key)
             )
 
     async def _dispatch(self, msg: InboundMessage) -> None:
@@ -687,7 +684,7 @@ class AgentLoop:
 
     def _sanitize_persisted_blocks(
         self,
-        content: List[Dict[str, Any]],
+        content: List[Any],
         *,
         truncate_text: bool = False,
         drop_runtime: bool = False,
@@ -705,9 +702,6 @@ class AgentLoop:
         filtered: List[Dict[str, Any]] = []
         for block in content:
             if not isinstance(block, dict):
-                # This is the problematic line. The function is hinted to return a
-                # List[Dict[str, Any]], but this line can append a non-dict.
-                # To fix, we will wrap non-dict blocks in a dict.
                 if isinstance(block, str):
                     filtered.append({"type": "text", "text": block})
                 continue
