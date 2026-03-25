@@ -165,6 +165,22 @@ def _get_provider_keywords() -> dict[str, list[str]]:
     except ImportError:
         return {}
 
+@lru_cache(maxsize=128)
+def get_model_provider(model: str) -> str | None:
+    """Guess the provider from the model name."""
+    provider_keywords = _get_provider_keywords()
+    model_lower = model.lower()
+
+    if "/" in model:
+        provider_prefix = model.split("/")[0]
+        if provider_prefix in provider_keywords:
+            return provider_prefix
+
+    for provider, keywords in provider_keywords.items():
+        if any(kw in model_lower for kw in keywords):
+            return provider
+
+    return None
 
 def get_model_suggestions(partial: str, provider: str = "auto", limit: int = 20) -> list[str]:
     """Get autocomplete suggestions for model names.
@@ -225,6 +241,9 @@ def get_model_suggestions(partial: str, provider: str = "auto", limit: int = 20)
 
     return matches[:limit]
 
+def get_provider_models(provider: str) -> list[str]:
+    """Get all models for a given provider."""
+    return get_model_suggestions(partial="", provider=provider, limit=1000)
 
 def format_token_count(tokens: int) -> str:
     """Format token count for display (e.g., 200000 -> '200,000')."""
